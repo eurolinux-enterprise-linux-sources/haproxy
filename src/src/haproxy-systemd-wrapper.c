@@ -22,24 +22,42 @@
 #define SD_DEBUG "<7>"
 #define SD_NOTICE "<5>"
 
+static volatile sig_atomic_t caught_signal;
+
 static char *pid_file = "/run/haproxy.pid";
 static int wrapper_argc;
 static char **wrapper_argv;
 
+/* returns the path to the haproxy binary into <buffer>, whose size indicated
+ * in <buffer_size> must be at least 1 byte long.
+ */
 static void locate_haproxy(char *buffer, size_t buffer_size)
 {
 	char *end = NULL;
+	int len;
 
-	if (readlink("/proc/self/exe", buffer, buffer_size) > 0)
-		end = strrchr(buffer, '/');
+	len = readlink("/proc/self/exe", buffer, buffer_size - 1);
+	if (len == -1)
+		goto fail;
 
-	if (end == NULL) {
-		strncpy(buffer, "/usr/sbin/haproxy", buffer_size);
+	buffer[len] = 0;
+	end = strrchr(buffer, '/');
+	if (end == NULL)
+		goto fail;
+
+	if (strcmp(end + strlen(end) - 16, "-systemd-wrapper") == 0) {
+		end[strlen(end) - 16] = '\0';
 		return;
 	}
+
 	end[1] = '\0';
 	strncpy(end + 1, "haproxy", buffer + buffer_size - (end + 1));
 	buffer[buffer_size - 1] = '\0';
+	return;
+ fail:
+	strncpy(buffer, "/usr/sbin/haproxy", buffer_size);
+	buffer[buffer_size - 1] = '\0';
+	return;
 }
 
 static void spawn_haproxy(char **pid_strv, int nb_pid)
@@ -103,15 +121,24 @@ static int read_pids(char ***pid_strv)
 	return read;
 }
 
-static void sigusr2_handler(int signum __attribute__((unused)))
+static void signal_handler(int signum)
+{
+	if (caught_signal != SIGINT && caught_signal != SIGTERM)
+		caught_signal = signum;
+}
+
+/* handles SIGUSR2 and SIGHUP only */
+static void do_restart(int sig)
 {
 	setenv(REEXEC_FLAG, "1", 1);
-	fprintf(stderr, SD_NOTICE "haproxy-systemd-wrapper: re-executing\n");
+	fprintf(stderr, SD_NOTICE "haproxy-systemd-wrapper: re-executing on %s.\n",
+	        sig == SIGUSR2 ? "SIGUSR2" : "SIGHUP");
 
 	execv(wrapper_argv[0], wrapper_argv);
 }
 
-static void sigint_handler(int signum __attribute__((unused)))
+/* handles SIGTERM and SIGINT only */
+static void do_shutdown(int sig)
 {
 	int i, pid;
 	char **pid_strv = NULL;
@@ -119,8 +146,9 @@ static void sigint_handler(int signum __attribute__((unused)))
 	for (i = 0; i < nb_pid; ++i) {
 		pid = atoi(pid_strv[i]);
 		if (pid > 0) {
-			fprintf(stderr, SD_DEBUG "haproxy-systemd-wrapper: SIGINT -> %d\n", pid);
-			kill(pid, SIGINT);
+			fprintf(stderr, SD_DEBUG "haproxy-systemd-wrapper: %s -> %d.\n",
+			        sig == SIGTERM ? "SIGTERM" : "SIGINT", pid);
+			kill(pid, sig);
 			free(pid_strv[i]);
 		}
 	}
@@ -147,24 +175,22 @@ int main(int argc, char **argv)
 	--argc; ++argv;
 	init(argc, argv);
 
-	signal(SIGINT, &sigint_handler);
-	signal(SIGUSR2, &sigusr2_handler);
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(struct sigaction));
+	sa.sa_handler = &signal_handler;
+	sigaction(SIGUSR2, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
 
 	if (getenv(REEXEC_FLAG) != NULL) {
 		/* We are being re-executed: restart HAProxy gracefully */
 		int i;
 		char **pid_strv = NULL;
 		int nb_pid = read_pids(&pid_strv);
-		sigset_t sigs;
 
 		unsetenv(REEXEC_FLAG);
 		spawn_haproxy(pid_strv, nb_pid);
-
-		/* Unblock SIGUSR2 which was blocked by the signal handler
-		 * before re-exec */
-		sigprocmask(SIG_BLOCK, NULL, &sigs);
-		sigdelset(&sigs, SIGUSR2);
-		sigprocmask(SIG_SETMASK, &sigs, NULL);
 
 		for (i = 0; i < nb_pid; ++i)
 			free(pid_strv[i]);
@@ -176,8 +202,18 @@ int main(int argc, char **argv)
 	}
 
 	status = -1;
-	while (-1 != wait(&status) || errno == EINTR)
-		;
+	while (caught_signal || wait(&status) != -1 || errno == EINTR) {
+		int sig = caught_signal;
+
+		if (caught_signal == SIGUSR2 || caught_signal == SIGHUP) {
+			caught_signal = 0;
+			do_restart(sig);
+		}
+		else if (caught_signal == SIGINT || caught_signal == SIGTERM) {
+			caught_signal = 0;
+			do_shutdown(sig);
+		}
+	}
 
 	fprintf(stderr, SD_NOTICE "haproxy-systemd-wrapper: exit, haproxy RC=%d\n",
 			status);

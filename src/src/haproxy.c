@@ -1,6 +1,6 @@
 /*
  * HA-Proxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2014  Willy Tarreau <w@1wt.eu>.
+ * Copyright 2000-2016 Willy Tarreau <willy@haproxy.org>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -25,6 +25,7 @@
  *
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -47,9 +48,7 @@
 #include <syslog.h>
 #include <grp.h>
 #ifdef USE_CPU_AFFINITY
-#define __USE_GNU
 #include <sched.h>
-#undef __USE_GNU
 #endif
 
 #ifdef DEBUG_FULL
@@ -216,7 +215,7 @@ unsigned int warned = 0;
 void display_version()
 {
 	printf("HA-Proxy version " HAPROXY_VERSION " " HAPROXY_DATE"\n");
-	printf("Copyright 2000-2014 Willy Tarreau <w@1wt.eu>\n\n");
+	printf("Copyright 2000-2016 Willy Tarreau <willy@haproxy.org>\n\n");
 }
 
 void display_build_opts()
@@ -503,7 +502,6 @@ void init(int argc, char **argv)
 	struct wordlist *wl;
 	char *progname;
 	char *change_dir = NULL;
-	struct tm curtime;
 
 	chunk_init(&trash, malloc(global.tune.bufsize), global.tune.bufsize);
 	alloc_trash_buffers(global.tune.bufsize);
@@ -528,14 +526,11 @@ void init(int argc, char **argv)
 	global.rlimit_memmax = HAPROXY_MEMMAX;
 #endif
 
+	tzset();
 	tv_update_date(-1,-1);
 	start_date = now;
 
 	srandom(now_ms - getpid());
-
-	/* Get the numeric timezone. */
-	get_localtime(start_date.tv_sec, &curtime);
-	strftime(localtimezone, 6, "%z", &curtime);
 
 	signal_init();
 	if (init_acl() != 0)
@@ -1020,12 +1015,6 @@ void deinit(void)
 			free(cwl);
 		}
 
-		list_for_each_entry_safe(cond, condb, &p->block_rules, list) {
-			LIST_DEL(&cond->list);
-			prune_acl_cond(cond);
-			free(cond);
-		}
-
 		list_for_each_entry_safe(cond, condb, &p->mon_fail_cond, list) {
 			LIST_DEL(&cond->list);
 			prune_acl_cond(cond);
@@ -1376,7 +1365,7 @@ int main(int argc, char **argv)
 
 	if (global.rlimit_memmax) {
 		limit.rlim_cur = limit.rlim_max =
-			global.rlimit_memmax * 1048576 / global.nbproc;
+			global.rlimit_memmax * 1048576ULL / global.nbproc;
 #ifdef RLIMIT_AS
 		if (setrlimit(RLIMIT_AS, &limit) == -1) {
 			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
@@ -1554,6 +1543,7 @@ int main(int argc, char **argv)
 
 	if (global.mode & (MODE_DAEMON | MODE_SYSTEMD)) {
 		struct proxy *px;
+		struct peers *curpeers;
 		int ret = 0;
 		int *children = calloc(global.nbproc, sizeof(int));
 		int proc;
@@ -1579,7 +1569,7 @@ int main(int argc, char **argv)
 
 #ifdef USE_CPU_AFFINITY
 		if (proc < global.nbproc &&  /* child */
-		    proc < 32 &&             /* only the first 32 processes may be pinned */
+		    proc < LONGBITS &&       /* only the first 32/64 processes may be pinned */
 		    global.cpu_map[proc])    /* only do this if the process has a CPU map */
 			sched_setaffinity(0, sizeof(unsigned long), (void *)&global.cpu_map[proc]);
 #endif
@@ -1594,6 +1584,15 @@ int main(int argc, char **argv)
 		free(global.chroot);  global.chroot = NULL;
 		free(global.pidfile); global.pidfile = NULL;
 
+		if (proc == global.nbproc) {
+			if (global.mode & MODE_SYSTEMD) {
+				protocol_unbind_all();
+				for (proc = 0; proc < global.nbproc; proc++)
+					while (waitpid(children[proc], NULL, 0) == -1 && errno == EINTR);
+			}
+			exit(0); /* parent must leave */
+		}
+
 		/* we might have to unbind some proxies from some processes */
 		px = proxy;
 		while (px != NULL) {
@@ -1604,13 +1603,17 @@ int main(int argc, char **argv)
 			px = px->next;
 		}
 
-		if (proc == global.nbproc) {
-			if (global.mode & MODE_SYSTEMD) {
-				protocol_unbind_all();
-				for (proc = 0; proc < global.nbproc; proc++)
-					while (waitpid(children[proc], NULL, 0) == -1 && errno == EINTR);
-			}
-			exit(0); /* parent must leave */
+		/* we might have to unbind some peers sections from some processes */
+		for (curpeers = peers; curpeers; curpeers = curpeers->next) {
+			if (!curpeers->peers_fe)
+				continue;
+
+			if (curpeers->peers_fe->bind_proc & (1UL << proc))
+				continue;
+
+			stop_proxy(curpeers->peers_fe);
+			/* disable this peer section so that it kills itself */
+			curpeers->peers_fe = NULL;
 		}
 
 		free(children);

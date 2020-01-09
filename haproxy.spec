@@ -8,8 +8,8 @@
 
 Name: haproxy
 Summary: HAProxy is a TCP/HTTP reverse proxy for high availability environments
-Version: 1.5.4
-Release: 3%{?dist}
+Version: 1.5.18
+Release: 1%{?dist}
 
 Group: System Environment/Daemons
 License: GPLv2+
@@ -23,8 +23,6 @@ Source4: haproxy.sysconfig
 Source5: halog.1
 
 Patch0: halog-unused-variables.patch
-Patch1: haproxy-buffer-slow-realign.patch
-Patch2: haproxy-max-hostname-length.patch
 
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 
@@ -62,8 +60,6 @@ availability environments. Indeed, it can:
 %prep
 %setup -q
 %patch0 -p0
-%patch1 -p1
-%patch2 -p1
 
 %build
 %ifarch %ix86 x86_64
@@ -157,6 +153,10 @@ fi
 %attr(-,%{haproxy_user},%{haproxy_group}) %dir %{haproxy_home}
 
 %changelog
+* Fri Oct 21 2016 Ryan O'Hara <rohara@redhat.com> - 1.5.18-1
+- Rebase to upstream version 1.5.18
+  Resolves: rhbz#1324652
+
 * Wed Jan 20 2016 Ryan O'Hara <rohara@redhat.com> - 1.5.4-3
 - Fix default MAX_HOSTNAME_LEN to allow long peer names
   Resolves: rhbz#1286504

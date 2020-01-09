@@ -36,15 +36,15 @@ int init_connection()
 }
 
 /* I/O callback for fd-based connections. It calls the read/write handlers
- * provided by the connection's sock_ops, which must be valid. It returns 0.
+ * provided by the connection's sock_ops, which must be valid.
  */
-int conn_fd_handler(int fd)
+void conn_fd_handler(int fd)
 {
 	struct connection *conn = fdtab[fd].owner;
 	unsigned int flags;
 
 	if (unlikely(!conn))
-		return 0;
+		return;
 
 	conn_refresh_polling_flags(conn);
 	flags = conn->flags & ~CO_FL_ERROR; /* ensure to call the wake handler upon error */
@@ -86,7 +86,7 @@ int conn_fd_handler(int fd)
 	 * we must not use it anymore and should immediately leave instead.
 	 */
 	if ((conn->flags & CO_FL_INIT_DATA) && conn->data->init(conn) < 0)
-		return 0;
+		return;
 
 	/* The data transfer starts here and stops on error and handshakes. Note
 	 * that we must absolutely test conn->xprt at each step in case it suddenly
@@ -133,7 +133,7 @@ int conn_fd_handler(int fd)
 	if ((conn->flags & CO_FL_WAKE_DATA) &&
 	    ((conn->flags ^ flags) & CO_FL_CONN_STATE) &&
 	    conn->data->wake(conn) < 0)
-		return 0;
+		return;
 
 	/* Last check, verify if the connection just established */
 	if (unlikely(!(conn->flags & (CO_FL_WAIT_L4_CONN | CO_FL_WAIT_L6_CONN | CO_FL_CONNECTED))))
@@ -144,7 +144,7 @@ int conn_fd_handler(int fd)
 
 	/* commit polling changes */
 	conn_cond_update_polling(conn);
-	return 0;
+	return;
 }
 
 /* Update polling on connection <c>'s file descriptor depending on its current
@@ -424,6 +424,9 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	case 0x01: /* PROXY command */
 		switch (hdr_v2->fam) {
 		case 0x11:  /* TCPv4 */
+			if (ntohs(hdr_v2->len) < PP2_ADDR_LEN_INET)
+				goto bad_header;
+
 			((struct sockaddr_in *)&conn->addr.from)->sin_family = AF_INET;
 			((struct sockaddr_in *)&conn->addr.from)->sin_addr.s_addr = hdr_v2->addr.ip4.src_addr;
 			((struct sockaddr_in *)&conn->addr.from)->sin_port = hdr_v2->addr.ip4.src_port;
@@ -433,6 +436,9 @@ int conn_recv_proxy(struct connection *conn, int flag)
 			conn->flags |= CO_FL_ADDR_FROM_SET | CO_FL_ADDR_TO_SET;
 			break;
 		case 0x21:  /* TCPv6 */
+			if (ntohs(hdr_v2->len) < PP2_ADDR_LEN_INET6)
+				goto bad_header;
+
 			((struct sockaddr_in6 *)&conn->addr.from)->sin6_family = AF_INET6;
 			memcpy(&((struct sockaddr_in6 *)&conn->addr.from)->sin6_addr, hdr_v2->addr.ip6.src_addr, 16);
 			((struct sockaddr_in6 *)&conn->addr.from)->sin6_port = hdr_v2->addr.ip6.src_port;

@@ -488,7 +488,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			}
 
 			/* Note: -m found is always valid, bool/int are compatible, str/bin/reg/len are compatible */
-			if (!sample_casts[cur_type][pat_match_types[idx]]) {
+			if (idx != PAT_MATCH_FOUND && !sample_casts[cur_type][pat_match_types[idx]]) {
 				memprintf(err, "matching method '%s' cannot be used with fetch keyword '%s'", args[1], expr->kw);
 				goto out_free_expr;
 			}
@@ -532,7 +532,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 	}
 
 	/* Create new pattern expression associated to this reference. */
-	pattern_expr = pattern_new_expr(&expr->pat, ref, err);
+	pattern_expr = pattern_new_expr(&expr->pat, ref, err, NULL);
 	if (!pattern_expr)
 		goto out_free_expr;
 

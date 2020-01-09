@@ -579,6 +579,7 @@ int session_complete(struct session *s)
 	/* and restore the connection pointer in case we destroyed it,
 	 * because kill_mini_session() will need it.
 	 */
+	LIST_DEL(&s->list);
 	s->target = &conn->obj_type;
 	return ret;
 }
@@ -886,6 +887,7 @@ static int sess_update_st_cer(struct session *s, struct stream_interface *si)
 	 */
 	if (objt_server(s->target) &&
 	    (si->conn_retries == 0 ||
+	     (__objt_server(s->target)->state < SRV_ST_RUNNING) ||
 	     (!(s->flags & SN_DIRECT) && s->be->srv_act > 1 &&
 	      ((s->be->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_RR))) &&
 	    s->be->options & PR_O_REDISP && !(s->flags & SN_FORCE_PRST)) {
@@ -1705,8 +1707,11 @@ struct task *process_session(struct task *t)
 		      (CF_SHUTR|CF_READ_ACTIVITY|CF_READ_TIMEOUT|CF_SHUTW|
 		       CF_WRITE_ACTIVITY|CF_WRITE_TIMEOUT|CF_ANA_TIMEOUT)) &&
 		    !((s->si[0].flags | s->si[1].flags) & (SI_FL_EXP|SI_FL_ERR)) &&
-		    ((t->state & TASK_WOKEN_ANY) == TASK_WOKEN_TIMER))
+		    ((t->state & TASK_WOKEN_ANY) == TASK_WOKEN_TIMER)) {
+			s->si[0].flags &= ~SI_FL_DONT_WAKE;
+			s->si[1].flags &= ~SI_FL_DONT_WAKE;
 			goto update_exp_and_leave;
+		}
 	}
 
 	/* 1b: check for low-level errors reported at the stream interface.
@@ -2181,7 +2186,7 @@ struct task *process_session(struct task *t)
 		 * to the consumer (which might possibly not be connected yet).
 		 */
 		if (!(s->req->flags & (CF_SHUTR|CF_SHUTW_NOW)))
-			channel_forward(s->req, CHN_INFINITE_FORWARD);
+			channel_forward_forever(s->req);
 	}
 
 	/* check if it is wise to enable kernel splicing to forward request data */
@@ -2212,10 +2217,6 @@ struct task *process_session(struct task *t)
 	if (unlikely((s->req->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_AUTO_CLOSE|CF_SHUTR)) ==
 		     (CF_AUTO_CLOSE|CF_SHUTR))) {
 		channel_shutw_now(s->req);
-		if (tick_isset(s->fe->timeout.clientfin)) {
-			s->rep->wto = s->fe->timeout.clientfin;
-			s->rep->wex = tick_add(now_ms, s->rep->wto);
-		}
 	}
 
 	/* shutdown(write) pending */
@@ -2240,10 +2241,6 @@ struct task *process_session(struct task *t)
 		if (s->req->prod->flags & SI_FL_NOHALF)
 			s->req->prod->flags |= SI_FL_NOLINGER;
 		si_shutr(s->req->prod);
-		if (tick_isset(s->fe->timeout.clientfin)) {
-			s->rep->wto = s->fe->timeout.clientfin;
-			s->rep->wex = tick_add(now_ms, s->rep->wto);
-		}
 	}
 
 	/* it's possible that an upper layer has requested a connection setup or abort.
@@ -2292,7 +2289,7 @@ struct task *process_session(struct task *t)
 
 			/* Now we can add the server name to a header (if requested) */
 			/* check for HTTP mode and proxy server_name_hdr_name != NULL */
-			if ((s->si[1].state >= SI_ST_CON) &&
+			if ((s->si[1].state >= SI_ST_CON) && (s->si[1].state < SI_ST_CLO) &&
 			    (s->be->server_id_hdr_name != NULL) &&
 			    (s->be->mode == PR_MODE_HTTP) &&
 			    objt_server(s->target)) {
@@ -2336,7 +2333,7 @@ struct task *process_session(struct task *t)
 		 * to the consumer.
 		 */
 		if (!(s->rep->flags & (CF_SHUTR|CF_SHUTW_NOW)))
-			channel_forward(s->rep, CHN_INFINITE_FORWARD);
+			channel_forward_forever(s->rep);
 
 		/* if we have no analyser anymore in any direction and have a
 		 * tunnel timeout set, use it now. Note that we must respect
@@ -2390,10 +2387,6 @@ struct task *process_session(struct task *t)
 	if (unlikely((s->rep->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_AUTO_CLOSE|CF_SHUTR)) ==
 		     (CF_AUTO_CLOSE|CF_SHUTR))) {
 		channel_shutw_now(s->rep);
-		if (tick_isset(s->be->timeout.serverfin)) {
-			s->req->wto = s->be->timeout.serverfin;
-			s->req->wex = tick_add(now_ms, s->req->wto);
-		}
 	}
 
 	/* shutdown(write) pending */
@@ -2416,10 +2409,6 @@ struct task *process_session(struct task *t)
 		if (s->rep->prod->flags & SI_FL_NOHALF)
 			s->rep->prod->flags |= SI_FL_NOLINGER;
 		si_shutr(s->rep->prod);
-		if (tick_isset(s->be->timeout.serverfin)) {
-			s->req->wto = s->be->timeout.serverfin;
-			s->req->wex = tick_add(now_ms, s->req->wto);
-		}
 	}
 
 	if (s->req->prod->state == SI_ST_DIS || s->req->cons->state == SI_ST_DIS)
@@ -2805,6 +2794,33 @@ smp_fetch_sc_stkctr(struct session *l4, const struct arg *args, const char *kw)
 	return &l4->stkctr[num];
 }
 
+/* same as smp_fetch_sc_stkctr() but dedicated to src_* and can create
+ * the entry if it doesn't exist yet. This is needed for a few fetch
+ * functions which need to create an entry, such as src_inc_gpc* and
+ * src_clr_gpc*.
+ */
+struct stkctr *
+smp_create_src_stkctr(struct session *sess, const struct arg *args, const char *kw)
+{
+	static struct stkctr stkctr;
+	struct stktable_key *key;
+	struct connection *conn = objt_conn(sess->si[0].end);
+
+	if (strncmp(kw, "src_", 4) != 0)
+		return NULL;
+
+	if (!conn)
+		return NULL;
+
+	key = addr_to_stktable_key(&conn->addr.from, args->data.prx->table.type);
+	if (!key)
+		return NULL;
+
+	stkctr.table = &args->data.prx->table;
+	stkctr_set_entry(&stkctr, stktable_update_key(stkctr.table, key));
+	return &stkctr;
+}
+
 /* set return a boolean indicating if the requested session counter is
  * currently being tracked or not.
  * Supports being called as "sc[0-9]_tracked" only.
@@ -2886,6 +2902,9 @@ smp_fetch_sc_inc_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned i
 	if (!stkctr)
 		return 0;
 
+	if (stkctr_entry(stkctr) == NULL)
+		stkctr = smp_create_src_stkctr(l4, args, kw);
+
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;
 	smp->data.uint = 0;
@@ -2922,6 +2941,9 @@ smp_fetch_sc_clr_gpc0(struct proxy *px, struct session *l4, void *l7, unsigned i
 
 	if (!stkctr)
 		return 0;
+
+	if (stkctr_entry(stkctr) == NULL)
+		stkctr = smp_create_src_stkctr(l4, args, kw);
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->type = SMP_T_UINT;

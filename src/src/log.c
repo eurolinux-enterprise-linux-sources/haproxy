@@ -167,22 +167,26 @@ struct logformat_var_args var_args_list[] = {
 static inline const char *fmt_directive(const struct proxy *curproxy)
 {
 	switch (curproxy->conf.args.ctx) {
-	case ARGC_UIF:
-		return "unique-id-format";
+	case ARGC_ACL:
+		return "acl";
+	case ARGC_STK:
+		return "stick";
+	case ARGC_TRK:
+		return "track-sc";
+	case ARGC_LOG:
+		return "log-format";
 	case ARGC_HRQ:
 		return "http-request";
 	case ARGC_HRS:
 		return "http-response";
-	case ARGC_STK:
-		return "stick";
-	case ARGC_TRK:
-		return "track-sc"; break;
+	case ARGC_UIF:
+		return "unique-id-format";
 	case ARGC_RDR:
-		return "redirect"; break;
-	case ARGC_ACL:
-		return "acl"; break;
+		return "redirect";
+	case ARGC_CAP:
+		return "capture";
 	default:
-		return "log-format";
+		return "undefined(please report this bug)"; /* must never happen */
 	}
 }
 
@@ -765,7 +769,7 @@ void send_log(struct proxy *p, int level, const char *format, ...)
 	char *dataptr;
 	int  data_len;
 
-	if (level < 0 || format == NULL)
+	if (level < 0 || format == NULL || logline == NULL)
 		return;
 
 	dataptr = update_log_hdr(); /* update log header and skip it */
@@ -1113,7 +1117,7 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 
 			case LOG_FMT_DATELOCAL: // %Tl
 				get_localtime(s->logs.accept_date.tv_sec, &tm);
-				ret = localdate2str_log(tmplog, &tm, dst + maxsize - tmplog);
+				ret = localdate2str_log(tmplog, s->logs.accept_date.tv_sec, &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;

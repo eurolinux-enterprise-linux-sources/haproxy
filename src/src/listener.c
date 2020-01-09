@@ -32,6 +32,7 @@
 #include <proto/fd.h>
 #include <proto/freq_ctr.h>
 #include <proto/log.h>
+#include <proto/listener.h>
 #include <proto/sample.h>
 #include <proto/task.h>
 
@@ -55,8 +56,7 @@ void enable_listener(struct listener *listener)
 			/* we don't want to enable this listener and don't
 			 * want any fd event to reach it.
 			 */
-			fd_stop_recv(listener->fd);
-			listener->state = LI_PAUSED;
+			unbind_listener(listener);
 		}
 		else if (listener->nbconn < listener->maxconn) {
 			fd_want_recv(listener->fd);
@@ -120,9 +120,10 @@ int pause_listener(struct listener *l)
  * may replace enable_listener(). The resulting state will either be LI_READY
  * or LI_FULL. 0 is returned in case of failure to resume (eg: dead socket).
  * Listeners bound to a different process are not woken up unless we're in
- * foreground mode. If the listener was only in the assigned state, it's totally
- * rebound. This can happen if a pause() has completely stopped it. If the
- * resume fails, 0 is returned and an error might be displayed.
+ * foreground mode, and are ignored. If the listener was only in the assigned
+ * state, it's totally rebound. This can happen if a pause() has completely
+ * stopped it. If the resume fails, 0 is returned and an error might be
+ * displayed.
  */
 int resume_listener(struct listener *l)
 {
@@ -146,7 +147,7 @@ int resume_listener(struct listener *l)
 	if ((global.mode & (MODE_DAEMON | MODE_SYSTEMD)) &&
 	    l->bind_conf->bind_proc &&
 	    !(l->bind_conf->bind_proc & (1UL << (relative_pid - 1))))
-		return 0;
+		return 1;
 
 	if (l->proto->sock_prot == IPPROTO_TCP &&
 	    l->state == LI_PAUSED &&
@@ -646,6 +647,7 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind
 {
 	struct eb32_node *node;
 	struct listener *l, *new;
+	char *error;
 
 	if (conf->listeners.n != conf->listeners.p) {
 		memprintf(err, "'%s' can only be used with a single socket", args[cur_arg]);
@@ -658,7 +660,11 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind
 	}
 
 	new = LIST_NEXT(&conf->listeners, struct listener *, by_bind);
-	new->luid = atol(args[cur_arg + 1]);
+	new->luid = strtol(args[cur_arg + 1], &error, 10);
+	if (*error != '\0') {
+		memprintf(err, "'%s' : expects an integer argument, found '%s'", args[cur_arg], args[cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
 	new->conf.id.key = new->luid;
 
 	if (new->luid <= 0) {

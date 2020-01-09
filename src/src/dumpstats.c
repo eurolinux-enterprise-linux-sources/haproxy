@@ -81,7 +81,7 @@ enum {
 	STAT_CLI_O_CLR,      /* clear tables */
 	STAT_CLI_O_SET,      /* set entries in tables */
 	STAT_CLI_O_STAT,     /* dump stats */
-	STAT_CLI_O_PATS,     /* list all pattern reference avalaible */
+	STAT_CLI_O_PATS,     /* list all pattern reference available */
 	STAT_CLI_O_PAT,      /* list all entries of a pattern */
 	STAT_CLI_O_MLOOK,    /* lookup a map entry */
 	STAT_CLI_O_POOLS,    /* dump memory pools */
@@ -131,6 +131,7 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 static int stats_pats_list(struct stream_interface *si);
 static int stats_pat_list(struct stream_interface *si);
 static int stats_map_lookup(struct stream_interface *si);
+static void cli_release_handler(struct stream_interface *si);
 
 /*
  * cli_io_handler()
@@ -185,12 +186,12 @@ static const char stats_sock_usage_msg[] =
 	"  disable        : put a server or frontend in maintenance mode\n"
 	"  enable         : re-enable a server or frontend which is in maintenance mode\n"
 	"  shutdown       : kill a session or a frontend (eg:to release listening ports)\n"
-	"  show acl [id]  : report avalaible acls or dump an acl's contents\n"
+	"  show acl [id]  : report available acls or dump an acl's contents\n"
 	"  get acl        : reports the patterns matching a sample for an ACL\n"
 	"  add acl        : add acl entry\n"
 	"  del acl        : delete acl entry\n"
 	"  clear acl <id> : clear the content of this acl\n"
-	"  show map [id]  : report avalaible maps or dump a map's contents\n"
+	"  show map [id]  : report available maps or dump a map's contents\n"
 	"  get map        : reports the keys and values matching a sample for a map\n"
 	"  set map        : modify map entry\n"
 	"  add map        : add map entry\n"
@@ -333,7 +334,7 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 					return -1;
 				}
 
-				if (kw->parse(args, cur_arg, curpx, bind_conf, err) != 0) {
+				if (kw->parse(args, cur_arg, global.stats_fe, bind_conf, err) != 0) {
 					if (err && *err)
 						memprintf(err, "'%s %s' : '%s'", args[0], args[1], *err);
 					else
@@ -1108,6 +1109,8 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 		arg++;
 	}
 
+	appctx->ctx.stats.scope_str = 0;
+	appctx->ctx.stats.scope_len = 0;
 	appctx->ctx.stats.flags = 0;
 	if (strcmp(args[0], "show") == 0) {
 		if (strcmp(args[1], "stat") == 0) {
@@ -1172,7 +1175,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			else
 				appctx->ctx.map.display_flags = PAT_REF_ACL;
 
-			/* no parameter: display all map avalaible */
+			/* no parameter: display all map available */
 			if (!*args[2]) {
 				appctx->st2 = STAT_ST_INIT;
 				appctx->st0 = STAT_CLI_O_PATS;
@@ -1294,8 +1297,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			pat_ref_prune(appctx->ctx.map.ref);
 
 			/* return response */
-			appctx->ctx.cli.msg = "Done.\n";
-			appctx->st0 = STAT_CLI_PRINT;
+			appctx->st0 = STAT_CLI_PROMPT;
 			return 1;
 		}
 		else {
@@ -1693,6 +1695,12 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				if (strcmp(args[3], "global") == 0) {
 					int v;
 
+					if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+						appctx->ctx.cli.msg = stats_permission_denied_msg;
+						appctx->st0 = STAT_CLI_PRINT;
+						return 1;
+					}
+
 					if (!*args[4]) {
 						appctx->ctx.cli.msg = "Expects a maximum input byte rate in kB/s.\n";
 						appctx->st0 = STAT_CLI_PRINT;
@@ -1787,8 +1795,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			}
 
 			/* The set is done, send message. */
-			appctx->ctx.cli.msg = "Done.\n";
-			appctx->st0 = STAT_CLI_PRINT;
+			appctx->st0 = STAT_CLI_PROMPT;
 			return 1;
 		}
 #ifdef USE_OPENSSL
@@ -2137,8 +2144,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			}
 
 			/* The deletion is done, send message. */
-			appctx->ctx.cli.msg = "Done.\n";
-			appctx->st0 = STAT_CLI_PRINT;
+			appctx->st0 = STAT_CLI_PROMPT;
 			return 1;
 		}
 		else { /* unknown "del" parameter */
@@ -2214,8 +2220,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			}
 
 			/* The add is done, send message. */
-			appctx->ctx.cli.msg = "Done.\n";
-			appctx->st0 = STAT_CLI_PRINT;
+			appctx->st0 = STAT_CLI_PROMPT;
 			return 1;
 		}
 		else { /* unknown "del" parameter */
@@ -2336,6 +2341,7 @@ static void cli_io_handler(struct stream_interface *si)
 		}
 		else {	/* output functions: first check if the output buffer is closed then abort */
 			if (res->flags & (CF_SHUTR_NOW|CF_SHUTR)) {
+				cli_release_handler(si);
 				appctx->st0 = STAT_CLI_END;
 				continue;
 			}
@@ -2389,6 +2395,7 @@ static void cli_io_handler(struct stream_interface *si)
 					appctx->st0 = STAT_CLI_PROMPT;
 				break;
 			default: /* abnormal state */
+				cli_release_handler(si);
 				appctx->st0 = STAT_CLI_PROMPT;
 				break;
 			}
@@ -2493,7 +2500,7 @@ static int stats_dump_info_to_buffer(struct stream_interface *si)
 	             "Hard_maxconn: %d\n"
 	             "CurrConns: %d\n"
 		     "CumConns: %d\n"
-		     "CumReq: %d\n"
+		     "CumReq: %u\n"
 #ifdef USE_OPENSSL
 		     "MaxSslConns: %d\n"
 	             "CurrSslConns: %d\n"
@@ -3107,7 +3114,7 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 			chunk_appendf(&trash, "%s ", human_time(now.tv_sec - sv->last_change, 1));
 			chunk_appendf(&trash, "MAINT");
 		}
-		else if ((ref->agent.state & CHK_ST_ENABLED) && (ref->state == SRV_ST_STOPPED)) {
+		else if ((ref->agent.state & CHK_ST_ENABLED) && !(sv->agent.health) && (ref->state == SRV_ST_STOPPED)) {
 			chunk_appendf(&trash, "%s ", human_time(now.tv_sec - ref->last_change, 1));
 			/* DOWN (agent) */
 			chunk_appendf(&trash, srv_hlt_st[1], "GCC: your -Werror=format-security is bogus, annoying, and hides real bugs, I don't thank you, really!");
@@ -4771,6 +4778,7 @@ static int stats_send_http_redirect(struct stream_interface *si)
 		     "Content-Type: text/plain\r\n"
 		     "Connection: close\r\n"
 		     "Location: %s;st=%s%s%s%s\r\n"
+		     "Content-length: 0\r\n"
 		     "\r\n",
 		     uri->uri_prefix,
 		     ((appctx->ctx.stats.st_code > STAT_STATUS_INIT) &&
@@ -5189,7 +5197,7 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 			              obj_base_ptr(conn->target));
 
 			chunk_appendf(&trash,
-			              "      flags=0x%08x fd=%d fd_spec_e=%02x fd_spec_p=%d updt=%d\n",
+			              "      flags=0x%08x fd=%d fd.state=%02x fd.cache=%d updt=%d\n",
 			              conn->flags,
 			              conn->t.sock.fd,
 			              conn->t.sock.fd >= 0 ? fdtab[conn->t.sock.fd].state : 0,
@@ -5292,8 +5300,8 @@ static int stats_pats_list(struct stream_interface *si)
 
 		/* Now, we start the browsing of the references lists.
 		 * Note that the following call to LIST_ELEM return bad pointer. The only
-		 * avalaible field of this pointer is <list>. It is used with the function
-		 * pat_list_get_next() for retruning the first avalaible entry
+		 * available field of this pointer is <list>. It is used with the function
+		 * pat_list_get_next() for retruning the first available entry
 		 */
 		appctx->ctx.map.ref = LIST_ELEM(&pattern_reference, struct pat_ref *, list);
 		appctx->ctx.map.ref = pat_list_get_next(appctx->ctx.map.ref, &pattern_reference,
@@ -5357,7 +5365,7 @@ static int stats_map_lookup(struct stream_interface *si)
 
 			/* execute pattern matching */
 			sample.type = SMP_T_STR;
-			sample.flags |= SMP_F_CONST;
+			sample.flags = SMP_F_CONST;
 			sample.data.str.len = appctx->ctx.map.chunk.len;
 			sample.data.str.str = appctx->ctx.map.chunk.str;
 			if (appctx->ctx.map.expr->pat_head->match &&
@@ -6045,7 +6053,7 @@ static int stats_dump_errors_to_buffer(struct stream_interface *si)
 				break;
 			case 1:
 				chunk_appendf(&trash,
-					     " backend %s (#%d) : invalid response\n"
+					     " backend %s (#%d): invalid response\n"
 					     "  frontend %s (#%d)",
 					     appctx->ctx.errors.px->id, appctx->ctx.errors.px->uuid,
 					     es->oe->id, es->oe->uuid);

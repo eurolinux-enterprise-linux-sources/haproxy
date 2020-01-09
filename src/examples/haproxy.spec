@@ -1,6 +1,6 @@
 Summary: HA-Proxy is a TCP/HTTP reverse proxy for high availability environments
 Name: haproxy
-Version: 1.5.4
+Version: 1.5.18
 Release: 1
 License: GPL
 Group: System Environment/Daemons
@@ -76,6 +76,48 @@ fi
 %attr(0755,root,root) %config %{_sysconfdir}/rc.d/init.d/%{name}
 
 %changelog
+* Tue May 10 2016 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.18
+
+* Wed Apr 13 2016 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.17
+
+* Mon Mar 14 2016 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.16
+
+* Sun Nov  1 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.15
+
+* Fri Jul  3 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.14
+
+* Fri Jun 26 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.13
+
+* Sat May  2 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.12
+
+* Sun Feb  1 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.11
+
+* Wed Dec 31 2014 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.10
+
+* Wed Nov 26 2014 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.9
+
+* Fri Oct 31 2014 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.8
+
+* Thu Oct 30 2014 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.7
+
+* Sat Oct 18 2014 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.6
+
+* Wed Oct  8 2014 Willy Tarreau <w@1wt.eu>
+- updated to 1.5.5
+
 * Tue Sep  2 2014 Willy Tarreau <w@1wt.eu>
 - updated to 1.5.4
 

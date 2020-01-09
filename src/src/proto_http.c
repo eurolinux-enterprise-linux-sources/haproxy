@@ -124,7 +124,7 @@ const char *HTTP_407_fmt =
 	"Content-Type: text/html\r\n"
 	"Proxy-Authenticate: Basic realm=\"%s\"\r\n"
 	"\r\n"
-	"<html><body><h1>401 Unauthorized</h1>\nYou need a valid user and password to access this content.\n</body></html>\n";
+	"<html><body><h1>407 Unauthorized</h1>\nYou need a valid user and password to access this content.\n</body></html>\n";
 
 
 const int http_err_codes[HTTP_ERR_SIZE] = {
@@ -353,6 +353,9 @@ const struct http_method_desc http_methods[26][3] = {
 	['H' - 'A'] = {
 		[0] = {	.meth = HTTP_METH_HEAD    , .len=4, .text="HEAD"    },
 	},
+	['O' - 'A'] = {
+		[0] = {	.meth = HTTP_METH_OPTIONS , .len=7, .text="OPTIONS" },
+	},
 	['P' - 'A'] = {
 		[0] = {	.meth = HTTP_METH_POST    , .len=4, .text="POST"    },
 		[1] = {	.meth = HTTP_METH_PUT     , .len=3, .text="PUT"     },
@@ -361,12 +364,11 @@ const struct http_method_desc http_methods[26][3] = {
 		[0] = {	.meth = HTTP_METH_TRACE   , .len=5, .text="TRACE"   },
 	},
 	/* rest is empty like this :
-	 *      [1] = {	.meth = HTTP_METH_NONE    , .len=0, .text=""        },
+	 *      [0] = {	.meth = HTTP_METH_OTHER   , .len=0, .text=""        },
 	 */
 };
 
 const struct http_method_name http_known_methods[HTTP_METH_OTHER] = {
-	[HTTP_METH_NONE]    = { "",         0 },
 	[HTTP_METH_OPTIONS] = { "OPTIONS",  7 },
 	[HTTP_METH_GET]     = { "GET",      3 },
 	[HTTP_METH_HEAD]    = { "HEAD",     4 },
@@ -731,7 +733,7 @@ int http_remove_header2(struct http_msg *msg, struct hdr_idx *idx, struct hdr_ct
 		if (idx->tail == ctx->idx)
 			idx->tail = ctx->prev;
 		ctx->idx = ctx->prev;    /* walk back to the end of previous header */
-		ctx->line -= idx->v[ctx->idx].len + idx->v[cur_idx].cr + 1;
+		ctx->line -= idx->v[ctx->idx].len + idx->v[ctx->idx].cr + 1;
 		ctx->val = idx->v[ctx->idx].len; /* point to end of previous header */
 		ctx->tws = ctx->vlen = 0;
 		return ctx->idx;
@@ -793,8 +795,8 @@ struct chunk *http_error_message(struct session *s, int msgnum)
 }
 
 /*
- * returns HTTP_METH_NONE if there is nothing valid to read (empty or non-text
- * string), HTTP_METH_OTHER for unknown methods, or the identified method.
+ * returns a known method among HTTP_METH_* or HTTP_METH_OTHER for all unknown
+ * ones.
  */
 enum http_meth_t find_http_meth(const char *str, const int len)
 {
@@ -810,10 +812,8 @@ enum http_meth_t find_http_meth(const char *str, const int len)
 			if (likely(memcmp(str, h->text, h->len) == 0))
 				return h->meth;
 		};
-		return HTTP_METH_OTHER;
 	}
-	return HTTP_METH_NONE;
-
+	return HTTP_METH_OTHER;
 }
 
 /* Parse the URI from the given transaction (which is assumed to be in request
@@ -1402,11 +1402,12 @@ get_http_auth(struct session *s)
 	h = ctx.line + ctx.val;
 
 	p = memchr(h, ' ', ctx.vlen);
-	if (!p || p == h)
+	len = p - h;
+	if (!p || len <= 0)
 		return 0;
 
-	chunk_initlen(&auth_method, h, 0, p-h);
-	chunk_initlen(&txn->auth.method_data, p+1, 0, ctx.vlen-(p-h)-1);
+	chunk_initlen(&auth_method, h, 0, len);
+	chunk_initlen(&txn->auth.method_data, p + 1, 0, ctx.vlen - len - 1);
 
 	if (!strncasecmp("Basic", auth_method.str, auth_method.len)) {
 
@@ -2393,6 +2394,59 @@ fail:
 	return 0;
 }
 
+void http_adjust_conn_mode(struct session *s, struct http_txn *txn, struct http_msg *msg)
+{
+	int tmp = TX_CON_WANT_KAL;
+
+	if (!((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA)) {
+		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN ||
+		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN)
+			tmp = TX_CON_WANT_TUN;
+
+		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
+		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
+			tmp = TX_CON_WANT_TUN;
+	}
+
+	if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL ||
+	    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL) {
+		/* option httpclose + server_close => forceclose */
+		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
+		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
+			tmp = TX_CON_WANT_CLO;
+		else
+			tmp = TX_CON_WANT_SCL;
+	}
+
+	if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL ||
+	    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL)
+		tmp = TX_CON_WANT_CLO;
+
+	if ((txn->flags & TX_CON_WANT_MSK) < tmp)
+		txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | tmp;
+
+	if (!(txn->flags & TX_HDR_CONN_PRS) &&
+	    (txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN) {
+		/* parse the Connection header and possibly clean it */
+		int to_del = 0;
+		if ((msg->flags & HTTP_MSGF_VER_11) ||
+		    ((txn->flags & TX_CON_WANT_MSK) >= TX_CON_WANT_SCL &&
+		     !((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA)))
+			to_del |= 2; /* remove "keep-alive" */
+		if (!(msg->flags & HTTP_MSGF_VER_11))
+			to_del |= 1; /* remove "close" */
+		http_parse_connection_header(txn, msg, to_del);
+	}
+
+	/* check if client or config asks for explicit close in KAL/SCL */
+	if (((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL ||
+	     (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL) &&
+	    ((txn->flags & TX_HDR_CONN_CLO) ||                         /* "connection: close" */
+	     (!(msg->flags & HTTP_MSGF_VER_11) && !(txn->flags & TX_HDR_CONN_KAL)) || /* no "connection: k-a" in 1.0 */
+	     !(msg->flags & HTTP_MSGF_XFER_LEN) ||                     /* no length known => close */
+	     s->fe->state == PR_STSTOPPED))                            /* frontend is stopping */
+		txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | TX_CON_WANT_CLO;
+}
 
 /* This stream analyser waits for a complete HTTP request. It returns 1 if the
  * processing can continue on next analysers, or zero if it either needs more
@@ -2425,7 +2479,6 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	 */
 
 	int cur_idx;
-	int use_close_only;
 	struct http_txn *txn = &s->txn;
 	struct http_msg *msg = &txn->req;
 	struct hdr_ctx ctx;
@@ -2493,7 +2546,7 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	/* 1: we might have to print this header in debug mode */
 	if (unlikely((global.mode & MODE_DEBUG) &&
 		     (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
-		     (msg->msg_state >= HTTP_MSG_BODY || msg->msg_state == HTTP_MSG_ERROR))) {
+		     msg->msg_state >= HTTP_MSG_BODY)) {
 		char *eol, *sol;
 
 		sol = req->buf->p;
@@ -2568,6 +2621,9 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 			if (txn->flags & TX_WAIT_NEXT_RQ)
 				goto failed_keep_alive;
 
+			if (s->fe->options & PR_O_IGNORE_PRB)
+				goto failed_keep_alive;
+
 			/* we cannot return any message on error */
 			if (msg->err_pos >= 0) {
 				http_capture_bad_message(&s->fe->invalid_req, s, msg, msg->msg_state, s->fe);
@@ -2598,6 +2654,9 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 			if (txn->flags & TX_WAIT_NEXT_RQ)
 				goto failed_keep_alive;
 
+			if (s->fe->options & PR_O_IGNORE_PRB)
+				goto failed_keep_alive;
+
 			/* read timeout : give up with an error message. */
 			if (msg->err_pos >= 0) {
 				http_capture_bad_message(&s->fe->invalid_req, s, msg, msg->msg_state, s->fe);
@@ -2625,6 +2684,9 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 				s->flags |= SN_ERR_CLICL;
 
 			if (txn->flags & TX_WAIT_NEXT_RQ)
+				goto failed_keep_alive;
+
+			if (s->fe->options & PR_O_IGNORE_PRB)
 				goto failed_keep_alive;
 
 			if (msg->err_pos >= 0)
@@ -2801,6 +2863,25 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	if (unlikely(msg->sl.rq.v_l == 0) && !http_upgrade_v09_to_v10(txn))
 		goto return_bad_req;
 
+	/* RFC7230#2.6 has enforced the format of the HTTP version string to be
+	 * exactly one digit "." one digit. This check may be disabled using
+	 * option accept-invalid-http-request.
+	 */
+	if (!(s->fe->options2 & PR_O2_REQBUG_OK)) {
+		if (msg->sl.rq.v_l != 8) {
+			msg->err_pos = msg->sl.rq.v;
+			goto return_bad_req;
+		}
+
+		if (req->buf->p[msg->sl.rq.v + 4] != '/' ||
+		    !isdigit((unsigned char)req->buf->p[msg->sl.rq.v + 5]) ||
+		    req->buf->p[msg->sl.rq.v + 6] != '.' ||
+		    !isdigit((unsigned char)req->buf->p[msg->sl.rq.v + 7])) {
+			msg->err_pos = msg->sl.rq.v + 4;
+			goto return_bad_req;
+		}
+	}
+
 	/* ... and check if the request is HTTP/1.1 or above */
 	if ((msg->sl.rq.v_l == 8) &&
 	    ((req->buf->p[msg->sl.rq.v + 5] > '1') ||
@@ -2832,62 +2913,93 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		capture_headers(req->buf->p, &txn->hdr_idx,
 				txn->req.cap, s->fe->req_cap);
 
-	/* 6: determine the transfer-length.
-	 * According to RFC2616 #4.4, amended by the HTTPbis working group,
-	 * the presence of a message-body in a REQUEST and its transfer length
-	 * must be determined that way (in order of precedence) :
-	 *   1. The presence of a message-body in a request is signaled by the
-	 *      inclusion of a Content-Length or Transfer-Encoding header field
-	 *      in the request's header fields.  When a request message contains
-	 *      both a message-body of non-zero length and a method that does
-	 *      not define any semantics for that request message-body, then an
-	 *      origin server SHOULD either ignore the message-body or respond
-	 *      with an appropriate error message (e.g., 413).  A proxy or
-	 *      gateway, when presented the same request, SHOULD either forward
-	 *      the request inbound with the message- body or ignore the
-	 *      message-body when determining a response.
+	/* 6: determine the transfer-length according to RFC2616 #4.4, updated
+	 * by RFC7230#3.3.3 :
 	 *
-	 *   2. If a Transfer-Encoding header field (Section 9.7) is present
-	 *      and the "chunked" transfer-coding (Section 6.2) is used, the
-	 *      transfer-length is defined by the use of this transfer-coding.
-	 *      If a Transfer-Encoding header field is present and the "chunked"
-	 *      transfer-coding is not present, the transfer-length is defined
-	 *      by the sender closing the connection.
+	 * The length of a message body is determined by one of the following
+	 *   (in order of precedence):
 	 *
-	 *   3. If a Content-Length header field is present, its decimal value in
-	 *      OCTETs represents both the entity-length and the transfer-length.
-	 *      If a message is received with both a Transfer-Encoding header
-	 *      field and a Content-Length header field, the latter MUST be ignored.
+	 *   1.  Any response to a HEAD request and any response with a 1xx
+	 *       (Informational), 204 (No Content), or 304 (Not Modified) status
+	 *       code is always terminated by the first empty line after the
+	 *       header fields, regardless of the header fields present in the
+	 *       message, and thus cannot contain a message body.
 	 *
-	 *   4. By the server closing the connection. (Closing the connection
-	 *      cannot be used to indicate the end of a request body, since that
-	 *      would leave no possibility for the server to send back a response.)
+	 *   2.  Any 2xx (Successful) response to a CONNECT request implies that
+	 *       the connection will become a tunnel immediately after the empty
+	 *       line that concludes the header fields.  A client MUST ignore any
+	 *       Content-Length or Transfer-Encoding header fields received in
+	 *       such a message.
 	 *
-	 *   Whenever a transfer-coding is applied to a message-body, the set of
-	 *   transfer-codings MUST include "chunked", unless the message indicates
-	 *   it is terminated by closing the connection.  When the "chunked"
-	 *   transfer-coding is used, it MUST be the last transfer-coding applied
-	 *   to the message-body.
+	 *   3.  If a Transfer-Encoding header field is present and the chunked
+	 *       transfer coding (Section 4.1) is the final encoding, the message
+	 *       body length is determined by reading and decoding the chunked
+	 *       data until the transfer coding indicates the data is complete.
+	 *
+	 *       If a Transfer-Encoding header field is present in a response and
+	 *       the chunked transfer coding is not the final encoding, the
+	 *       message body length is determined by reading the connection until
+	 *       it is closed by the server.  If a Transfer-Encoding header field
+	 *       is present in a request and the chunked transfer coding is not
+	 *       the final encoding, the message body length cannot be determined
+	 *       reliably; the server MUST respond with the 400 (Bad Request)
+	 *       status code and then close the connection.
+	 *
+	 *       If a message is received with both a Transfer-Encoding and a
+	 *       Content-Length header field, the Transfer-Encoding overrides the
+	 *       Content-Length.  Such a message might indicate an attempt to
+	 *       perform request smuggling (Section 9.5) or response splitting
+	 *       (Section 9.4) and ought to be handled as an error.  A sender MUST
+	 *       remove the received Content-Length field prior to forwarding such
+	 *       a message downstream.
+	 *
+	 *   4.  If a message is received without Transfer-Encoding and with
+	 *       either multiple Content-Length header fields having differing
+	 *       field-values or a single Content-Length header field having an
+	 *       invalid value, then the message framing is invalid and the
+	 *       recipient MUST treat it as an unrecoverable error.  If this is a
+	 *       request message, the server MUST respond with a 400 (Bad Request)
+	 *       status code and then close the connection.  If this is a response
+	 *       message received by a proxy, the proxy MUST close the connection
+	 *       to the server, discard the received response, and send a 502 (Bad
+	 *       Gateway) response to the client.  If this is a response message
+	 *       received by a user agent, the user agent MUST close the
+	 *       connection to the server and discard the received response.
+	 *
+	 *   5.  If a valid Content-Length header field is present without
+	 *       Transfer-Encoding, its decimal value defines the expected message
+	 *       body length in octets.  If the sender closes the connection or
+	 *       the recipient times out before the indicated number of octets are
+	 *       received, the recipient MUST consider the message to be
+	 *       incomplete and close the connection.
+	 *
+	 *   6.  If this is a request message and none of the above are true, then
+	 *       the message body length is zero (no message body is present).
+	 *
+	 *   7.  Otherwise, this is a response message without a declared message
+	 *       body length, so the message body length is determined by the
+	 *       number of octets received prior to the server closing the
+	 *       connection.
 	 */
 
-	use_close_only = 0;
 	ctx.idx = 0;
 	/* set TE_CHNK and XFER_LEN only if "chunked" is seen last */
-	while ((msg->flags & HTTP_MSGF_VER_11) &&
-	       http_find_header2("Transfer-Encoding", 17, req->buf->p, &txn->hdr_idx, &ctx)) {
+	while (http_find_header2("Transfer-Encoding", 17, req->buf->p, &txn->hdr_idx, &ctx)) {
 		if (ctx.vlen == 7 && strncasecmp(ctx.line + ctx.val, "chunked", 7) == 0)
 			msg->flags |= (HTTP_MSGF_TE_CHNK | HTTP_MSGF_XFER_LEN);
 		else if (msg->flags & HTTP_MSGF_TE_CHNK) {
-			/* bad transfer-encoding (chunked followed by something else) */
-			use_close_only = 1;
-			msg->flags &= ~(HTTP_MSGF_TE_CHNK | HTTP_MSGF_XFER_LEN);
-			break;
+			/* chunked not last, return badreq */
+			goto return_bad_req;
 		}
 	}
 
+	/* Chunked requests must have their content-length removed */
 	ctx.idx = 0;
-	while (!(msg->flags & HTTP_MSGF_TE_CHNK) && !use_close_only &&
-	       http_find_header2("Content-Length", 14, req->buf->p, &txn->hdr_idx, &ctx)) {
+	if (msg->flags & HTTP_MSGF_TE_CHNK) {
+		while (http_find_header2("Content-Length", 14, req->buf->p, &txn->hdr_idx, &ctx))
+			http_remove_header2(msg, &txn->hdr_idx, &ctx);
+	}
+	else while (http_find_header2("Content-Length", 14, req->buf->p, &txn->hdr_idx, &ctx)) {
 		signed long long cl;
 
 		if (!ctx.vlen) {
@@ -2914,9 +3026,8 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 		msg->body_len = msg->chunk_len = cl;
 	}
 
-	/* bodyless requests have a known length */
-	if (!use_close_only)
-		msg->flags |= HTTP_MSGF_XFER_LEN;
+	/* even bodyless requests have a known length */
+	msg->flags |= HTTP_MSGF_XFER_LEN;
 
 	/* Until set to anything else, the connection mode is set as Keep-Alive. It will
 	 * only change if both the request and the config reference something else.
@@ -2929,58 +3040,8 @@ int http_wait_for_request(struct session *s, struct channel *req, int an_bit)
 	 * time.
 	 */
 	if (!(txn->flags & TX_HDR_CONN_PRS) ||
-	    ((s->fe->options & PR_O_HTTP_MODE) != (s->be->options & PR_O_HTTP_MODE))) {
-		int tmp = TX_CON_WANT_KAL;
-
-		if (!((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA)) {
-			if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN ||
-			    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN)
-				tmp = TX_CON_WANT_TUN;
-
-			if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
-			    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
-				tmp = TX_CON_WANT_TUN;
-		}
-
-		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL ||
-		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_SCL) {
-			/* option httpclose + server_close => forceclose */
-			if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
-			    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL)
-				tmp = TX_CON_WANT_CLO;
-			else
-				tmp = TX_CON_WANT_SCL;
-		}
-
-		if ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL ||
-		    (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_FCL)
-			tmp = TX_CON_WANT_CLO;
-
-		if ((txn->flags & TX_CON_WANT_MSK) < tmp)
-			txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | tmp;
-
-		if (!(txn->flags & TX_HDR_CONN_PRS) &&
-		    (txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN) {
-			/* parse the Connection header and possibly clean it */
-			int to_del = 0;
-			if ((msg->flags & HTTP_MSGF_VER_11) ||
-			    ((txn->flags & TX_CON_WANT_MSK) >= TX_CON_WANT_SCL &&
-			     !((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA)))
-				to_del |= 2; /* remove "keep-alive" */
-			if (!(msg->flags & HTTP_MSGF_VER_11))
-				to_del |= 1; /* remove "close" */
-			http_parse_connection_header(txn, msg, to_del);
-		}
-
-		/* check if client or config asks for explicit close in KAL/SCL */
-		if (((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL ||
-		     (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL) &&
-		    ((txn->flags & TX_HDR_CONN_CLO) ||                         /* "connection: close" */
-		     (!(msg->flags & HTTP_MSGF_VER_11) && !(txn->flags & TX_HDR_CONN_KAL)) || /* no "connection: k-a" in 1.0 */
-		     !(msg->flags & HTTP_MSGF_XFER_LEN) ||                     /* no length known => close */
-		     s->fe->state == PR_STSTOPPED))                            /* frontend is stopping */
-		    txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | TX_CON_WANT_CLO;
-	}
+	    ((s->fe->options & PR_O_HTTP_MODE) != (s->be->options & PR_O_HTTP_MODE)))
+		http_adjust_conn_mode(s, txn, msg);
 
 	/* end of job, return OK */
 	req->analysers &= ~an_bit;
@@ -3176,113 +3237,55 @@ static inline void inet_set_tos(int fd, struct sockaddr_storage from, int tos)
 #endif
 }
 
-/* Returns the number of characters written to destination,
- * -1 on internal error and -2 if no replacement took place.
- */
-static int http_replace_header(struct my_regex *re, char *dst, uint dst_size, char *val, int len,
-                               const char *rep_str)
-{
-	if (!regex_exec_match2(re, val, len, MAX_MATCH, pmatch))
-		return -2;
-
-	return exp_replace(dst, dst_size, val, rep_str, pmatch);
-}
-
-/* Returns the number of characters written to destination,
- * -1 on internal error and -2 if no replacement took place.
- */
-static int http_replace_value(struct my_regex *re, char *dst, uint dst_size, char *val, int len, char delim,
-                              const char *rep_str)
-{
-	char* p = val;
-	char* dst_end = dst + dst_size;
-	char* dst_p = dst;
-
-	for (;;) {
-		char *p_delim;
-
-		/* look for delim. */
-		p_delim = p;
-		while (p_delim < p + len && *p_delim != delim)
-			p_delim++;
-
-		if (regex_exec_match2(re, p, p_delim-p, MAX_MATCH, pmatch)) {
-			int replace_n = exp_replace(dst_p, dst_end - dst_p, p, rep_str, pmatch);
-
-			if (replace_n < 0)
-				return -1;
-
-			dst_p += replace_n;
-		} else {
-			uint len = p_delim - p;
-
-			if (dst_p + len >= dst_end)
-				return -1;
-
-			memcpy(dst_p, p, len);
-			dst_p += len;
-		}
-
-		if (dst_p >= dst_end)
-			return -1;
-
-		/* end of the replacements. */
-		if (p_delim >= p + len)
-			break;
-
-		/* Next part. */
-		*dst_p++ = delim;
-		p = p_delim + 1;
-	}
-
-	return dst_p - dst;
-}
-
 static int http_transform_header(struct session* s, struct http_msg *msg, const char* name, uint name_len,
                                  char* buf, struct hdr_idx* idx, struct list *fmt, struct my_regex *re,
                                  struct hdr_ctx* ctx, int action)
 {
+	int (*http_find_hdr_func)(const char *name, int len, char *sol,
+	                          struct hdr_idx *idx, struct hdr_ctx *ctx);
+	struct chunk *replace = get_trash_chunk();
+	struct chunk *output = get_trash_chunk();
+
+	replace->len = build_logline(s, replace->str, replace->size, fmt);
+	if (replace->len >= replace->size - 1)
+		return -1;
+
 	ctx->idx = 0;
 
-	while (http_find_full_header2(name, name_len, buf, idx, ctx)) {
+	/* Choose the header browsing function. */
+	switch (action) {
+	case HTTP_REQ_ACT_REPLACE_VAL:
+	case HTTP_RES_ACT_REPLACE_VAL:
+		http_find_hdr_func = http_find_header2;
+		break;
+	case HTTP_REQ_ACT_REPLACE_HDR:
+	case HTTP_RES_ACT_REPLACE_HDR:
+		http_find_hdr_func = http_find_full_header2;
+		break;
+	default: /* impossible */
+		return -1;
+	}
+
+	while (http_find_hdr_func(name, name_len, buf, idx, ctx)) {
 		struct hdr_idx_elem *hdr = idx->v + ctx->idx;
 		int delta;
-		char* val = (char*)ctx->line + name_len + 2;
-		char* val_end = (char*)ctx->line + hdr->len;
-		char* reg_dst_buf;
-		uint reg_dst_buf_size;
-		int n_replaced;
+		char *val = ctx->line + ctx->val;
+		char* val_end = val + ctx->vlen;
 
-		trash.len = build_logline(s, trash.str, trash.size, fmt);
+		if (!regex_exec_match2(re, val, val_end-val, MAX_MATCH, pmatch))
+			continue;
 
-		if (trash.len >= trash.size - 1)
+		output->len = exp_replace(output->str, output->size, val, replace->str, pmatch);
+		if (output->len == -1)
 			return -1;
 
-		reg_dst_buf = trash.str + trash.len + 1;
-		reg_dst_buf_size = trash.size - trash.len - 1;
-
-		switch (action) {
-		case HTTP_REQ_ACT_REPLACE_VAL:
-		case HTTP_RES_ACT_REPLACE_VAL:
-			n_replaced = http_replace_value(re, reg_dst_buf, reg_dst_buf_size, val, val_end-val, ',', trash.str);
-			break;
-		case HTTP_REQ_ACT_REPLACE_HDR:
-		case HTTP_RES_ACT_REPLACE_HDR:
-			n_replaced = http_replace_header(re, reg_dst_buf, reg_dst_buf_size, val, val_end-val, trash.str);
-			break;
-		default: /* impossible */
-			return -1;
-		}
-
-		switch (n_replaced) {
-		case -1: return -1;
-		case -2: continue;
-		}
-
-		delta = buffer_replace2(msg->chn->buf, val, val_end, reg_dst_buf, n_replaced);
+		delta = buffer_replace2(msg->chn->buf, val, val_end, output->str, output->len);
 
 		hdr->len += delta;
 		http_msg_move_end(msg, delta);
+
+		/* Adjust the length of the current value of the index. */
+		ctx->vlen += delta;
 	}
 
 	return 0;
@@ -3386,17 +3389,15 @@ http_req_get_intercept_rule(struct proxy *px, struct list *rules, struct session
 			break;
 
 		case HTTP_REQ_ACT_DEL_HDR:
-		case HTTP_REQ_ACT_SET_HDR:
 			ctx.idx = 0;
 			/* remove all occurrences of the header */
 			while (http_find_header2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len,
 						 txn->req.chn->buf->p, &txn->hdr_idx, &ctx)) {
 				http_remove_header2(&txn->req, &txn->hdr_idx, &ctx);
 			}
-			if (rule->action == HTTP_REQ_ACT_DEL_HDR)
-				break;
-			/* now fall through to header addition */
+			break;
 
+		case HTTP_REQ_ACT_SET_HDR:
 		case HTTP_REQ_ACT_ADD_HDR:
 			chunk_printf(&trash, "%s: ", rule->arg.hdr_add.name);
 			memcpy(trash.str, rule->arg.hdr_add.name, rule->arg.hdr_add.name_len);
@@ -3404,6 +3405,16 @@ http_req_get_intercept_rule(struct proxy *px, struct list *rules, struct session
 			trash.str[trash.len++] = ':';
 			trash.str[trash.len++] = ' ';
 			trash.len += build_logline(s, trash.str + trash.len, trash.size - trash.len, &rule->arg.hdr_add.fmt);
+
+			if (rule->action == HTTP_REQ_ACT_SET_HDR) {
+				/* remove all occurrences of the header */
+				ctx.idx = 0;
+				while (http_find_header2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len,
+							 txn->req.chn->buf->p, &txn->hdr_idx, &ctx)) {
+					http_remove_header2(&txn->req, &txn->hdr_idx, &ctx);
+				}
+			}
+
 			http_header_add_tail2(&txn->req, &txn->hdr_idx, trash.str, trash.len);
 			break;
 
@@ -3575,17 +3586,15 @@ http_res_get_intercept_rule(struct proxy *px, struct list *rules, struct session
 			break;
 
 		case HTTP_RES_ACT_DEL_HDR:
-		case HTTP_RES_ACT_SET_HDR:
 			ctx.idx = 0;
 			/* remove all occurrences of the header */
 			while (http_find_header2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len,
 						 txn->rsp.chn->buf->p, &txn->hdr_idx, &ctx)) {
 				http_remove_header2(&txn->rsp, &txn->hdr_idx, &ctx);
 			}
-			if (rule->action == HTTP_RES_ACT_DEL_HDR)
-				break;
-			/* now fall through to header addition */
+			break;
 
+		case HTTP_RES_ACT_SET_HDR:
 		case HTTP_RES_ACT_ADD_HDR:
 			chunk_printf(&trash, "%s: ", rule->arg.hdr_add.name);
 			memcpy(trash.str, rule->arg.hdr_add.name, rule->arg.hdr_add.name_len);
@@ -3593,6 +3602,15 @@ http_res_get_intercept_rule(struct proxy *px, struct list *rules, struct session
 			trash.str[trash.len++] = ':';
 			trash.str[trash.len++] = ' ';
 			trash.len += build_logline(s, trash.str + trash.len, trash.size - trash.len, &rule->arg.hdr_add.fmt);
+
+			if (rule->action == HTTP_RES_ACT_SET_HDR) {
+				/* remove all occurrences of the header */
+				ctx.idx = 0;
+				while (http_find_header2(rule->arg.hdr_add.name, rule->arg.hdr_add.name_len,
+							 txn->rsp.chn->buf->p, &txn->hdr_idx, &ctx)) {
+					http_remove_header2(&txn->rsp, &txn->hdr_idx, &ctx);
+				}
+			}
 			http_header_add_tail2(&txn->rsp, &txn->hdr_idx, trash.str, trash.len);
 			break;
 
@@ -4083,8 +4101,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 			select_compression_request_header(s, req->buf);
 
 		/* enable the minimally required analyzers to handle keep-alive and compression on the HTTP response */
-		req->analysers = (req->analysers & AN_REQ_HTTP_BODY) |
-		                 AN_REQ_HTTP_XFER_BODY | AN_RES_WAIT_HTTP | AN_RES_HTTP_PROCESS_BE | AN_RES_HTTP_XFER_BODY;
+		req->analysers = (req->analysers & AN_REQ_HTTP_BODY) | AN_REQ_HTTP_XFER_BODY;
 		goto done;
 	}
 
@@ -4135,6 +4152,12 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 	 */
 	channel_dont_connect(req);
 	req->analysers = 0; /* remove switching rules etc... */
+
+	/* Allow cookie logging
+	 */
+	if (s->be->cookie_name || s->fe->capture_name)
+		manage_client_side_cookies(s, req);
+
 	req->analysers |= AN_REQ_HTTP_TARPIT;
 	req->analyse_exp = tick_add_ifset(now_ms,  s->be->timeout.tarpit);
 	if (!req->analyse_exp)
@@ -4148,6 +4171,12 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 	goto done_without_exp;
 
  deny:	/* this request was blocked (denied) */
+
+	/* Allow cookie logging
+	 */
+	if (s->be->cookie_name || s->fe->capture_name)
+		manage_client_side_cookies(s, req);
+
 	txn->flags |= TX_CLDENY;
 	txn->status = 403;
 	s->logs.tv_request = now;
@@ -4288,8 +4317,7 @@ int http_process_request(struct session *s, struct channel *req, int an_bit)
 	 * the fields will stay coherent and the URI will not move.
 	 * This should only be performed in the backend.
 	 */
-	if ((s->be->cookie_name || s->be->appsession_name || s->fe->capture_name)
-	    && !(txn->flags & (TX_CLDENY|TX_CLTARPIT)))
+	if (s->be->cookie_name || s->be->appsession_name || s->fe->capture_name)
 		manage_client_side_cookies(s, req);
 
 	/*
@@ -4632,7 +4660,7 @@ int http_wait_for_request_body(struct session *s, struct channel *req, int an_bi
 
 	if (!(msg->flags & HTTP_MSGF_TE_CHNK)) {
 		/* We're in content-length mode, we just have to wait for enough data. */
-		if (req->buf->i - msg->sov < msg->body_len)
+		if (http_body_bytes(msg) < msg->body_len)
 			goto missing_data;
 
 		/* OK we have everything we need now */
@@ -4657,13 +4685,14 @@ int http_wait_for_request_body(struct session *s, struct channel *req, int an_bi
 	}
 
 	/* Now we're in HTTP_MSG_DATA or HTTP_MSG_TRAILERS state.
-	 * We have the first data byte is in msg->sov. We're waiting for at
-	 * least a whole chunk or the whole content length bytes after msg->sov.
+	 * We have the first data byte is in msg->sov + msg->sol. We're waiting
+	 * for at least a whole chunk or the whole content length bytes after
+	 * msg->sov + msg->sol.
 	 */
 	if (msg->msg_state == HTTP_MSG_TRAILERS)
 		goto http_end;
 
-	if (req->buf->i - msg->sov >= msg->body_len)   /* we have enough bytes now */
+	if (http_body_bytes(msg) >= msg->body_len)   /* we have enough bytes now */
 		goto http_end;
 
  missing_data:
@@ -4890,6 +4919,7 @@ void http_end_txn_clean_session(struct session *s)
 	s->rep->flags &= ~(CF_SHUTR|CF_SHUTR_NOW|CF_READ_ATTACHED|CF_READ_ERROR|CF_READ_NOEXP|CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_PARTIAL|CF_NEVER_WAIT|CF_WROTE_DATA);
 	s->flags &= ~(SN_DIRECT|SN_ASSIGNED|SN_ADDR_SET|SN_BE_ASSIGNED|SN_FORCE_PRST|SN_IGNORE_PRST);
 	s->flags &= ~(SN_CURR_SESS|SN_REDIRECTABLE|SN_SRV_REUSED);
+	s->flags &= ~(SN_ERR_MASK|SN_FINST_MASK|SN_REDISP);
 
 	s->txn.meth = 0;
 	http_reset_txn(s);
@@ -4928,11 +4958,13 @@ void http_end_txn_clean_session(struct session *s)
 			s->rep->flags |= CF_EXPECT_MORE;
 	}
 
-	/* we're removing the analysers, we MUST re-enable events detection */
+	/* we're removing the analysers, we MUST re-enable events detection.
+	 * We don't enable close on the response channel since it's either
+	 * already closed, or in keep-alive with an idle connection handler.
+	 */
 	channel_auto_read(s->req);
 	channel_auto_close(s->req);
 	channel_auto_read(s->rep);
-	channel_auto_close(s->rep);
 
 	/* we're in keep-alive with an idle connection, monitor it */
 	si_idle_conn(s->req->cons);
@@ -4983,6 +5015,13 @@ int http_sync_req_state(struct session *s)
 		 */
 		chn->cons->flags |= SI_FL_NOHALF;
 
+		/* In any case we've finished parsing the request so we must
+		 * disable Nagle when sending data because 1) we're not going
+		 * to shut this side, and 2) the server is waiting for us to
+		 * send pending data.
+		 */
+		chn->flags |= CF_NEVER_WAIT;
+
 		if (txn->rsp.msg_state == HTTP_MSG_ERROR)
 			goto wait_other_side;
 
@@ -4997,7 +5036,6 @@ int http_sync_req_state(struct session *s)
 			/* if any side switches to tunnel mode, the other one does too */
 			channel_auto_read(chn);
 			txn->req.msg_state = HTTP_MSG_TUNNEL;
-			chn->flags |= CF_NEVER_WAIT;
 			goto wait_other_side;
 		}
 
@@ -5030,7 +5068,6 @@ int http_sync_req_state(struct session *s)
 			if ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_TUN) {
 				channel_auto_read(chn);
 				txn->req.msg_state = HTTP_MSG_TUNNEL;
-				chn->flags |= CF_NEVER_WAIT;
 			}
 		}
 
@@ -5273,9 +5310,18 @@ int http_resync_states(struct session *s)
 		  (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL)) {
 		/* server-close/keep-alive: terminate this transaction,
 		 * possibly killing the server connection and reinitialize
-		 * a fresh-new transaction.
+		 * a fresh-new transaction, but only once we're sure there's
+		 * enough room in the request and response buffer to process
+		 * another request. The request buffer must not hold any
+		 * pending output data and the request buffer must not have
+		 * output data occupying the reserve.
 		 */
-		http_end_txn_clean_session(s);
+		if (s->req->buf->o)
+			s->req->flags |= CF_WAKE_WRITE;
+		else if (channel_congested(s->rep))
+			s->rep->flags |= CF_WAKE_WRITE;
+		else
+			http_end_txn_clean_session(s);
 	}
 
 	return txn->req.msg_state != old_req_state ||
@@ -5434,9 +5480,10 @@ int http_request_forward_body(struct session *s, struct channel *req, int an_bit
 				msg->sov -= msg->next;
 			msg->next = 0;
 
-			/* for keep-alive we don't want to forward closes on DONE */
-			if ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL ||
-			    (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL)
+			/* we don't want to forward closes on DONE except in
+			 * tunnel mode.
+			 */
+			if ((txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN)
 				channel_dont_close(req);
 			if (http_resync_states(s)) {
 				/* some state changes occurred, maybe the analyser
@@ -5460,10 +5507,15 @@ int http_request_forward_body(struct session *s, struct channel *req, int an_bit
 			 * want to monitor the client's connection and forward
 			 * any shutdown notification to the server, which will
 			 * decide whether to close or to go on processing the
-			 * request.
+			 * request. We only do that in tunnel mode, and not in
+			 * other modes since it can be abused to exhaust source
+			 * ports.
 			 */
 			if (s->be->options & PR_O_ABRT_CLOSE) {
 				channel_auto_read(req);
+				if ((req->flags & (CF_SHUTR|CF_READ_NULL)) &&
+				    ((txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN))
+					s->si[1].flags |= SI_FL_NOLINGER;
 				channel_auto_close(req);
 			}
 			else if (s->txn.meth == HTTP_METH_POST) {
@@ -5658,7 +5710,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	/* 1: we might have to print this header in debug mode */
 	if (unlikely((global.mode & MODE_DEBUG) &&
 		     (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
-		     (msg->msg_state >= HTTP_MSG_BODY || msg->msg_state == HTTP_MSG_ERROR))) {
+		     msg->msg_state >= HTTP_MSG_BODY)) {
 		char *eol, *sol;
 
 		sol = rep->buf->p;
@@ -5758,8 +5810,6 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 		else if (rep->flags & CF_READ_TIMEOUT) {
 			if (msg->err_pos >= 0)
 				http_capture_bad_message(&s->be->invalid_rep, s, msg, msg->msg_state, s->fe);
-			else if (txn->flags & TX_NOT_FIRST)
-				goto abort_keep_alive;
 
 			s->be->be_counters.failed_resp++;
 			if (objt_server(s->target)) {
@@ -5881,6 +5931,25 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 	if (objt_server(s->target))
 		objt_server(s->target)->counters.p.http.rsp[n]++;
 
+	/* RFC7230#2.6 has enforced the format of the HTTP version string to be
+	 * exactly one digit "." one digit. This check may be disabled using
+	 * option accept-invalid-http-response.
+	 */
+	if (!(s->be->options2 & PR_O2_RSPBUG_OK)) {
+		if (msg->sl.st.v_l != 8) {
+			msg->err_pos = 0;
+			goto hdr_response_bad;
+		}
+
+		if (rep->buf->p[4] != '/' ||
+		    !isdigit((unsigned char)rep->buf->p[5]) ||
+		    rep->buf->p[6] != '.' ||
+		    !isdigit((unsigned char)rep->buf->p[7])) {
+			msg->err_pos = 4;
+			goto hdr_response_bad;
+		}
+	}
+
 	/* check if the response is HTTP/1.1 or above */
 	if ((msg->sl.st.v_l == 8) &&
 	    ((rep->buf->p[5] > '1') ||
@@ -5958,44 +6027,73 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 		capture_headers(rep->buf->p, &txn->hdr_idx,
 				txn->rsp.cap, s->fe->rsp_cap);
 
-	/* 4: determine the transfer-length.
-	 * According to RFC2616 #4.4, amended by the HTTPbis working group,
-	 * the presence of a message-body in a RESPONSE and its transfer length
-	 * must be determined that way :
+	/* 4: determine the transfer-length according to RFC2616 #4.4, updated
+	 * by RFC7230#3.3.3 :
 	 *
-	 *   All responses to the HEAD request method MUST NOT include a
-	 *   message-body, even though the presence of entity-header fields
-	 *   might lead one to believe they do.  All 1xx (informational), 204
-	 *   (No Content), and 304 (Not Modified) responses MUST NOT include a
-	 *   message-body.  All other responses do include a message-body,
-	 *   although it MAY be of zero length.
+	 * The length of a message body is determined by one of the following
+	 *   (in order of precedence):
 	 *
-	 *   1. Any response which "MUST NOT" include a message-body (such as the
-	 *      1xx, 204 and 304 responses and any response to a HEAD request) is
-	 *      always terminated by the first empty line after the header fields,
-	 *      regardless of the entity-header fields present in the message.
+	 *   1.  Any response to a HEAD request and any response with a 1xx
+	 *       (Informational), 204 (No Content), or 304 (Not Modified) status
+	 *       code is always terminated by the first empty line after the
+	 *       header fields, regardless of the header fields present in the
+	 *       message, and thus cannot contain a message body.
 	 *
-	 *   2. If a Transfer-Encoding header field (Section 9.7) is present and
-	 *      the "chunked" transfer-coding (Section 6.2) is used, the
-	 *      transfer-length is defined by the use of this transfer-coding.
-	 *      If a Transfer-Encoding header field is present and the "chunked"
-	 *      transfer-coding is not present, the transfer-length is defined by
-	 *      the sender closing the connection.
+	 *   2.  Any 2xx (Successful) response to a CONNECT request implies that
+	 *       the connection will become a tunnel immediately after the empty
+	 *       line that concludes the header fields.  A client MUST ignore any
+	 *       Content-Length or Transfer-Encoding header fields received in
+	 *       such a message.
 	 *
-	 *   3. If a Content-Length header field is present, its decimal value in
-	 *      OCTETs represents both the entity-length and the transfer-length.
-	 *      If a message is received with both a Transfer-Encoding header
-	 *      field and a Content-Length header field, the latter MUST be ignored.
+	 *   3.  If a Transfer-Encoding header field is present and the chunked
+	 *       transfer coding (Section 4.1) is the final encoding, the message
+	 *       body length is determined by reading and decoding the chunked
+	 *       data until the transfer coding indicates the data is complete.
 	 *
-	 *   4. If the message uses the media type "multipart/byteranges", and
-	 *      the transfer-length is not otherwise specified, then this self-
-	 *      delimiting media type defines the transfer-length.  This media
-	 *      type MUST NOT be used unless the sender knows that the recipient
-	 *      can parse it; the presence in a request of a Range header with
-	 *      multiple byte-range specifiers from a 1.1 client implies that the
-	 *      client can parse multipart/byteranges responses.
+	 *       If a Transfer-Encoding header field is present in a response and
+	 *       the chunked transfer coding is not the final encoding, the
+	 *       message body length is determined by reading the connection until
+	 *       it is closed by the server.  If a Transfer-Encoding header field
+	 *       is present in a request and the chunked transfer coding is not
+	 *       the final encoding, the message body length cannot be determined
+	 *       reliably; the server MUST respond with the 400 (Bad Request)
+	 *       status code and then close the connection.
 	 *
-	 *   5. By the server closing the connection.
+	 *       If a message is received with both a Transfer-Encoding and a
+	 *       Content-Length header field, the Transfer-Encoding overrides the
+	 *       Content-Length.  Such a message might indicate an attempt to
+	 *       perform request smuggling (Section 9.5) or response splitting
+	 *       (Section 9.4) and ought to be handled as an error.  A sender MUST
+	 *       remove the received Content-Length field prior to forwarding such
+	 *       a message downstream.
+	 *
+	 *   4.  If a message is received without Transfer-Encoding and with
+	 *       either multiple Content-Length header fields having differing
+	 *       field-values or a single Content-Length header field having an
+	 *       invalid value, then the message framing is invalid and the
+	 *       recipient MUST treat it as an unrecoverable error.  If this is a
+	 *       request message, the server MUST respond with a 400 (Bad Request)
+	 *       status code and then close the connection.  If this is a response
+	 *       message received by a proxy, the proxy MUST close the connection
+	 *       to the server, discard the received response, and send a 502 (Bad
+	 *       Gateway) response to the client.  If this is a response message
+	 *       received by a user agent, the user agent MUST close the
+	 *       connection to the server and discard the received response.
+	 *
+	 *   5.  If a valid Content-Length header field is present without
+	 *       Transfer-Encoding, its decimal value defines the expected message
+	 *       body length in octets.  If the sender closes the connection or
+	 *       the recipient times out before the indicated number of octets are
+	 *       received, the recipient MUST consider the message to be
+	 *       incomplete and close the connection.
+	 *
+	 *   6.  If this is a request message and none of the above are true, then
+	 *       the message body length is zero (no message body is present).
+	 *
+	 *   7.  Otherwise, this is a response message without a declared message
+	 *       body length, so the message body length is determined by the
+	 *       number of octets received prior to the server closing the
+	 *       connection.
 	 */
 
 	/* Skip parsing if no content length is possible. The response flags
@@ -6013,8 +6111,7 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 
 	use_close_only = 0;
 	ctx.idx = 0;
-	while ((msg->flags & HTTP_MSGF_VER_11) &&
-	       http_find_header2("Transfer-Encoding", 17, rep->buf->p, &txn->hdr_idx, &ctx)) {
+	while (http_find_header2("Transfer-Encoding", 17, rep->buf->p, &txn->hdr_idx, &ctx)) {
 		if (ctx.vlen == 7 && strncasecmp(ctx.line + ctx.val, "chunked", 7) == 0)
 			msg->flags |= (HTTP_MSGF_TE_CHNK | HTTP_MSGF_XFER_LEN);
 		else if (msg->flags & HTTP_MSGF_TE_CHNK) {
@@ -6025,10 +6122,13 @@ int http_wait_for_response(struct session *s, struct channel *rep, int an_bit)
 		}
 	}
 
-	/* FIXME: below we should remove the content-length header(s) in case of chunked encoding */
+	/* Chunked responses must have their content-length removed */
 	ctx.idx = 0;
-	while (!(msg->flags & HTTP_MSGF_TE_CHNK) && !use_close_only &&
-	       http_find_header2("Content-Length", 14, rep->buf->p, &txn->hdr_idx, &ctx)) {
+	if (use_close_only || (msg->flags & HTTP_MSGF_TE_CHNK)) {
+		while (http_find_header2("Content-Length", 14, rep->buf->p, &txn->hdr_idx, &ctx))
+			http_remove_header2(msg, &txn->hdr_idx, &ctx);
+	}
+	else while (http_find_header2("Content-Length", 14, rep->buf->p, &txn->hdr_idx, &ctx)) {
 		signed long long cl;
 
 		if (!ctx.vlen) {
@@ -6249,7 +6349,7 @@ int http_process_res_common(struct session *s, struct channel *rep, int an_bit, 
 
 		/* add response headers from the rule sets in the same order */
 		list_for_each_entry(wl, &rule_set->rsp_add, list) {
-			if (txn->status < 200)
+			if (txn->status < 200 && txn->status != 101)
 				break;
 			if (wl->cond) {
 				int ret = acl_exec_cond(wl->cond, px, s, txn, SMP_OPT_DIR_RES|SMP_OPT_FINAL);
@@ -6270,7 +6370,7 @@ int http_process_res_common(struct session *s, struct channel *rep, int an_bit, 
 	}
 
 	/* OK that's all we can do for 1xx responses */
-	if (unlikely(txn->status < 200))
+	if (unlikely(txn->status < 200 && txn->status != 101))
 		goto skip_header_mangling;
 
 	/*
@@ -6283,7 +6383,7 @@ int http_process_res_common(struct session *s, struct channel *rep, int an_bit, 
 	/*
 	 * Check for cache-control or pragma headers if required.
 	 */
-	if ((s->be->options & PR_O_CHK_CACHE) || (s->be->ck_opts & PR_CK_NOC))
+	if (((s->be->options & PR_O_CHK_CACHE) || (s->be->ck_opts & PR_CK_NOC)) && txn->status != 101)
 		check_response_for_cacheability(s, rep);
 
 	/*
@@ -6399,9 +6499,11 @@ int http_process_res_common(struct session *s, struct channel *rep, int an_bit, 
 	 * Adjust "Connection: close" or "Connection: keep-alive" if needed.
 	 * If an "Upgrade" token is found, the header is left untouched in order
 	 * not to have to deal with some client bugs : some of them fail an upgrade
-	 * if anything but "Upgrade" is present in the Connection header.
+	 * if anything but "Upgrade" is present in the Connection header. We don't
+	 * want to touch any 101 response either since it's switching to another
+	 * protocol.
 	 */
-	if (!(txn->flags & TX_HDR_CONN_UPG) &&
+	if ((txn->status != 101) && !(txn->flags & TX_HDR_CONN_UPG) &&
 	    (((txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN) ||
 	     ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
 	      (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL))) {
@@ -6694,12 +6796,15 @@ int http_response_forward_body(struct session *s, struct channel *res, int an_bi
 	if (res->flags & CF_SHUTR) {
 		if ((s->req->flags & (CF_SHUTR|CF_SHUTW)) == (CF_SHUTR|CF_SHUTW))
 			goto aborted_xfer;
-		if (!(s->flags & SN_ERR_MASK))
-			s->flags |= SN_ERR_SRVCL;
-		s->be->be_counters.srv_aborts++;
-		if (objt_server(s->target))
-			objt_server(s->target)->counters.srv_aborts++;
-		goto return_bad_res_stats_ok;
+		/* If we have some pending data, we continue the processing */
+		if (!buffer_pending(res->buf)) {
+			if (!(s->flags & SN_ERR_MASK))
+				s->flags |= SN_ERR_SRVCL;
+			s->be->be_counters.srv_aborts++;
+			if (objt_server(s->target))
+				objt_server(s->target)->counters.srv_aborts++;
+			goto return_bad_res_stats_ok;
+		}
 	}
 
 	/* we need to obey the req analyser, so if it leaves, we must too */
@@ -7040,7 +7145,8 @@ int apply_filters_to_request(struct session *s, struct channel *req, struct prox
 			/* The filter did not match the request, it can be
 			 * iterated through all headers.
 			 */
-			apply_filter_to_req_headers(s, req, exp);
+			if (unlikely(apply_filter_to_req_headers(s, req, exp) < 0))
+				return -1;
 		}
 	}
 	return 0;
@@ -8596,10 +8702,13 @@ unsigned int http_get_fhdr(const struct http_msg *msg, const char *hname, int hl
 	}
 	if (-occ > found)
 		return 0;
+
 	/* OK now we have the last occurrence in [hist_ptr-1], and we need to
-	 * find occurrence -occ, so we have to check [hist_ptr+occ].
+	 * find occurrence -occ. 0 <= hist_ptr < MAX_HDR_HISTORY, and we have
+	 * -10 <= occ <= -1. So we have to check [hist_ptr%MAX_HDR_HISTORY+occ]
+	 * to remain in the 0..9 range.
 	 */
-	hist_ptr += occ;
+	hist_ptr += occ + MAX_HDR_HISTORY;
 	if (hist_ptr >= MAX_HDR_HISTORY)
 		hist_ptr -= MAX_HDR_HISTORY;
 	*vptr = ptr_hist[hist_ptr];
@@ -9606,7 +9715,7 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 		 * if prefix == "/", we don't want to add anything, otherwise it
 		 * makes it hard for the user to configure a self-redirection.
 		 */
-		proxy->conf.args.ctx = ARGC_RDR;
+		curproxy->conf.args.ctx = ARGC_RDR;
 		if (!(type == REDIRECT_TYPE_PREFIX && destination[0] == '/' && destination[1] == '\0')) {
 			parse_logformat_string(destination, curproxy, &rule->rdr_fmt, LOG_OPT_HTTP,
 			                       (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
@@ -10051,15 +10160,19 @@ smp_fetch_fhdr_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int 
 	struct hdr_ctx ctx;
 	const struct http_msg *msg = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_REQ) ? &txn->req : &txn->rsp;
 	int cnt;
+	const char *name = NULL;
+	int len = 0;
 
-	if (!args || args->type != ARGT_STR)
-		return 0;
+	if (args && args->type == ARGT_STR) {
+		name = args->data.str.str;
+		len = args->data.str.len;
+	}
 
 	CHECK_HTTP_MESSAGE_FIRST();
 
 	ctx.idx = 0;
 	cnt = 0;
-	while (http_find_full_header2(args->data.str.str, args->data.str.len, msg->chn->buf->p, idx, &ctx))
+	while (http_find_full_header2(name, len, msg->chn->buf->p, idx, &ctx))
 		cnt++;
 
 	smp->type = SMP_T_UINT;
@@ -10138,15 +10251,19 @@ smp_fetch_hdr_cnt(struct proxy *px, struct session *l4, void *l7, unsigned int o
 	struct hdr_ctx ctx;
 	const struct http_msg *msg = ((opt & SMP_OPT_DIR) == SMP_OPT_DIR_REQ) ? &txn->req : &txn->rsp;
 	int cnt;
+	const char *name = NULL;
+	int len = 0;
 
-	if (!args || args->type != ARGT_STR)
-		return 0;
+	if (args && args->type == ARGT_STR) {
+		name = args->data.str.str;
+		len = args->data.str.len;
+	}
 
 	CHECK_HTTP_MESSAGE_FIRST();
 
 	ctx.idx = 0;
 	cnt = 0;
-	while (http_find_header2(args->data.str.str, args->data.str.len, msg->chn->buf->p, idx, &ctx))
+	while (http_find_header2(name, len, msg->chn->buf->p, idx, &ctx))
 		cnt++;
 
 	smp->type = SMP_T_UINT;
@@ -10960,9 +11077,11 @@ find_url_param_pos(char* query_string, size_t query_string_l,
 }
 
 /*
- * Given a url parameter name, returns its value and size into *value and
- * *value_l respectively, and returns non-zero. If the parameter is not found,
- * zero is returned and value/value_l are not touched.
+ * Given a url parameter name and a query string, find the next value.
+ * An empty url_param_name matches the first available parameter.
+ * If the parameter is found, 1 is returned and *value / *value_l are updated
+ * to respectively provide a pointer to the value and its length.
+ * Otherwise, 0 is returned and value/value_l are not modified.
  */
 static int
 find_url_param_value(char* path, size_t path_l,
@@ -10992,7 +11111,7 @@ find_url_param_value(char* path, size_t path_l,
 
 	*value = value_start;
 	*value_l = value_end - value_start;
-	return value_end != value_start;
+	return 1;
 }
 
 static int
@@ -11153,7 +11272,7 @@ static int val_hdr(struct arg *arg, char **err_msg)
  */
 static int sample_conv_http_date(const struct arg *args, struct sample *smp)
 {
-	const char day[7][4] = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+	const char day[7][4] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 	const char mon[12][4] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 	struct chunk *temp;
 	struct tm *tm;
@@ -11164,6 +11283,8 @@ static int sample_conv_http_date(const struct arg *args, struct sample *smp)
 		curr_date += args[0].data.sint;
 
 	tm = gmtime(&curr_date);
+	if (!tm)
+		return 0;
 
 	temp = get_trash_chunk();
 	temp->len = snprintf(temp->str, temp->size - temp->len,

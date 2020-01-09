@@ -887,6 +887,9 @@ struct pattern *pat_match_ip(struct sample *smp, struct pattern_expr *expr, int 
 			}
 			else
 				continue;
+		} else {
+		  /* impossible */
+		  continue;
 		}
 
 		/* Check if the input sample match the current pattern. */
@@ -989,8 +992,10 @@ int pat_idx_list_ptr(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* allocate pattern */
 	patl = calloc(1, sizeof(*patl));
-	if (!patl)
+	if (!patl) {
+		memprintf(err, "out of memory while indexing pattern");
 		return 0;
+	}
 
 	/* duplicate pattern */
 	memcpy(&patl->pat, pat, sizeof(*pat));
@@ -1306,6 +1311,10 @@ void pat_del_tree_str(struct pattern_expr *expr, struct pat_ref_elt *ref)
 	struct ebmb_node *node, *next_node;
 	struct pattern_tree *elt;
 
+	/* If the flag PAT_F_IGNORE_CASE is set, we cannot use trees */
+	if (expr->mflags & PAT_MF_IGNORE_CASE)
+		return pat_del_list_ptr(expr, ref);
+
 	/* browse each node of the tree. */
 	for (node = ebmb_first(&expr->pattern_tree), next_node = node ? ebmb_next(node) : NULL;
 	     node;
@@ -1417,14 +1426,13 @@ int pat_ref_delete_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt)
 	/* delete pattern from reference */
 	list_for_each_entry_safe(elt, safe, &ref->head, list) {
 		if (elt == refelt) {
+			list_for_each_entry(expr, &ref->pat, list)
+				pattern_delete(expr, elt);
+
 			LIST_DEL(&elt->list);
 			free(elt->sample);
 			free(elt->pattern);
 			free(elt);
-
-			list_for_each_entry(expr, &ref->pat, list)
-				pattern_delete(expr, elt);
-
 			return 1;
 		}
 	}
@@ -1855,11 +1863,18 @@ struct pattern_expr *pattern_lookup_expr(struct pattern_head *head, struct pat_r
  * <ref> can be NULL. If an error is occured, the function returns NULL and
  * <err> is filled. Otherwise, the function returns new pattern_expr linked
  * with <head> and <ref>.
+ *
+ * The returned value can be a alredy filled pattern list, in this case the
+ * flag <reuse> is set.
  */
-struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref *ref, char **err)
+struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref *ref,
+                                      char **err, int *reuse)
 {
 	struct pattern_expr *expr;
 	struct pattern_expr_list *list;
+
+	if (reuse)
+		*reuse = 0;
 
 	/* Memory and initialization of the chain element. */
 	list = malloc(sizeof(*list));
@@ -1889,6 +1904,7 @@ struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref 
 		/* Get a lot of memory for the expr struct. */
 		expr = malloc(sizeof(*expr));
 		if (!expr) {
+			free(list);
 			memprintf(err, "out of memory");
 			return NULL;
 		}
@@ -1915,6 +1931,8 @@ struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref 
 		 * with ref and we must not free it.
 		 */
 		list->do_free = 0;
+		if (reuse)
+			*reuse = 1;
 	}
 
 	/* The new list element reference the pattern_expr. */
@@ -2087,6 +2105,7 @@ int pattern_read_from_file(struct pattern_head *head, unsigned int refflags,
 	struct pat_ref *ref;
 	struct pattern_expr *expr;
 	struct pat_ref_elt *elt;
+	int reuse = 0;
 
 	/* Lookup for the existing reference. */
 	ref = pat_ref_lookup(filename);
@@ -2161,11 +2180,19 @@ int pattern_read_from_file(struct pattern_head *head, unsigned int refflags,
 	 */
 	expr = pattern_lookup_expr(head, ref);
 	if (!expr || (expr->mflags != patflags)) {
-		expr = pattern_new_expr(head, ref, err);
+		expr = pattern_new_expr(head, ref, err, &reuse);
 		if (!expr)
 			return 0;
 		expr->mflags = patflags;
 	}
+
+	/* The returned expression may be not empty, because the function
+	 * "pattern_new_expr" lookup for similar pattern list and can
+	 * reuse a already filled pattern list. In this case, we can not
+	 * reload the patterns.
+	 */
+	if (reuse)
+		return 1;
 
 	/* Load reference content in the pattern expression. */
 	list_for_each_entry(elt, &ref->head, list) {

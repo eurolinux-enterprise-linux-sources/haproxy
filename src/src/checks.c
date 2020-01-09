@@ -246,7 +246,7 @@ static void set_server_check_status(struct check *check, short status, const cha
 		 * cause the server to be marked down.
 		 */
 		if ((!(check->state & CHK_ST_AGENT) ||
-		    (check->status >= HCHK_STATUS_L7TOUT)) &&
+		    (check->status >= HCHK_STATUS_L57DATA)) &&
 		    (check->health >= check->rise)) {
 			s->counters.failed_checks++;
 			report = 1;
@@ -580,6 +580,7 @@ static void chk_report_conn_err(struct connection *conn, int errno_bck, int expi
 	struct check *check = conn->owner;
 	const char *err_msg;
 	struct chunk *chk;
+	int step;
 
 	if (check->result != CHK_RES_UNKNOWN)
 		return;
@@ -599,19 +600,27 @@ static void chk_report_conn_err(struct connection *conn, int errno_bck, int expi
 	chk = get_trash_chunk();
 
 	if (check->type == PR_O2_TCPCHK_CHK) {
-		chunk_printf(chk, " at step %d of tcp-check", tcpcheck_get_step_id(check->server));
-		/* we were looking for a string */
-		if (check->current_step && check->current_step->action == TCPCHK_ACT_CONNECT) {
-			chunk_appendf(chk, " (connect)");
-		}
-		else if (check->current_step && check->current_step->action == TCPCHK_ACT_EXPECT) {
-			if (check->current_step->string)
-				chunk_appendf(chk, " (string '%s')", check->current_step->string);
-			else if (check->current_step->expect_regex)
-				chunk_appendf(chk, " (expect regex)");
-		}
-		else if (check->current_step && check->current_step->action == TCPCHK_ACT_SEND) {
-			chunk_appendf(chk, " (send)");
+		step = tcpcheck_get_step_id(check->server);
+		if (!step)
+			chunk_printf(chk, " at initial connection step of tcp-check");
+		else {
+			chunk_printf(chk, " at step %d of tcp-check", step);
+			/* we were looking for a string */
+			if (check->last_started_step && check->last_started_step->action == TCPCHK_ACT_CONNECT) {
+				if (check->last_started_step->port)
+					chunk_appendf(chk, " (connect port %d)" ,check->last_started_step->port);
+				else
+					chunk_appendf(chk, " (connect)");
+			}
+			else if (check->last_started_step && check->last_started_step->action == TCPCHK_ACT_EXPECT) {
+				if (check->last_started_step->string)
+					chunk_appendf(chk, " (expect string '%s')", check->last_started_step->string);
+				else if (check->last_started_step->expect_regex)
+					chunk_appendf(chk, " (expect regex)");
+			}
+			else if (check->last_started_step && check->last_started_step->action == TCPCHK_ACT_SEND) {
+				chunk_appendf(chk, " (send)");
+			}
 		}
 	}
 
@@ -1372,6 +1381,7 @@ static int connect_chk(struct task *t)
 	struct connection *conn = check->conn;
 	struct protocol *proto;
 	int ret;
+	int quickack;
 
 	/* tcpcheck send/expect initialisation */
 	if (check->type == PR_O2_TCPCHK_CHK)
@@ -1397,6 +1407,9 @@ static int connect_chk(struct task *t)
 		else if ((check->type) == PR_O2_HTTP_CHK) {
 			if (s->proxy->options2 & PR_O2_CHK_SNDST)
 				bo_putblk(check->bo, trash.str, httpchk_build_status_header(s, trash.str, trash.size));
+			/* prevent HTTP keep-alive when "http-check expect" is used */
+			if (s->proxy->options2 & PR_O2_EXP_TYPE)
+				bo_putstr(check->bo, "Connection: close\r\n");
 			bo_putstr(check->bo, "\r\n");
 			*check->bo->p = '\0'; /* to make gdb output easier to read */
 		}
@@ -1404,7 +1417,7 @@ static int connect_chk(struct task *t)
 
 	/* prepare a new connection */
 	conn_init(conn);
-	conn_prepare(conn, s->check_common.proto, s->check_common.xprt);
+	conn_prepare(conn, s->check_common.proto, check->xprt);
 	conn_attach(conn, check, &check_conn_cb);
 	conn->target = &s->obj_type;
 
@@ -1427,18 +1440,26 @@ static int connect_chk(struct task *t)
 		set_host_port(&conn->addr.to, check->port);
 	}
 
-	if (check->type == PR_O2_TCPCHK_CHK) {
-		struct tcpcheck_rule *r = (struct tcpcheck_rule *) s->proxy->tcpcheck_rules.n;
+	/* only plain tcp-check supports quick ACK */
+	quickack = check->type == 0 || check->type == PR_O2_TCPCHK_CHK;
+
+	if (check->type == PR_O2_TCPCHK_CHK && !LIST_ISEMPTY(&s->proxy->tcpcheck_rules)) {
+		struct tcpcheck_rule *r;
+
+		r = LIST_NEXT(&s->proxy->tcpcheck_rules, struct tcpcheck_rule *, list);
+
 		/* if first step is a 'connect', then tcpcheck_main must run it */
 		if (r->action == TCPCHK_ACT_CONNECT) {
 			tcpcheck_main(conn);
 			return SN_ERR_UP;
 		}
+		if (r->action == TCPCHK_ACT_EXPECT)
+			quickack = 0;
 	}
 
 	ret = SN_ERR_INTERNAL;
 	if (proto->connect)
-		ret = proto->connect(conn, check->type, (check->type) ? 0 : 2);
+		ret = proto->connect(conn, check->type, quickack ? 2 : 0);
 	conn->flags |= CO_FL_WAKE_DATA;
 	if (s->check.send_proxy) {
 		conn->send_proxy_ofs = 1;
@@ -1818,6 +1839,10 @@ static int tcpcheck_get_step_id(struct server *s)
 	struct tcpcheck_rule *cur = NULL, *next = NULL;
 	int i = 0;
 
+	/* not even started anything yet => step 0 = initial connect */
+	if (!s->check.current_step)
+		return 0;
+
 	cur = s->check.last_started_step;
 
 	/* no step => first step */
@@ -1837,20 +1862,34 @@ static int tcpcheck_get_step_id(struct server *s)
 static void tcpcheck_main(struct connection *conn)
 {
 	char *contentptr;
-	struct list *head = NULL;
-	struct tcpcheck_rule *cur = NULL;
+	struct tcpcheck_rule *next;
 	int done = 0, ret = 0;
-
 	struct check *check = conn->owner;
 	struct server *s = check->server;
 	struct task *t = check->task;
+	struct list *head = &s->proxy->tcpcheck_rules;
 
-	/*
-	 * don't do anything until the connection is established but if we're running
-	 * first step which must be a connect
+	/* here, we know that the check is complete or that it failed */
+	if (check->result != CHK_RES_UNKNOWN)
+		goto out_end_tcpcheck;
+
+	/* We have 4 possibilities here :
+	 *   1. we've not yet attempted step 1, and step 1 is a connect, so no
+	 *      connection attempt was made yet ;
+	 *   2. we've not yet attempted step 1, and step 1 is a not connect or
+	 *      does not exist (no rule), so a connection attempt was made
+	 *      before coming here.
+	 *   3. we're coming back after having started with step 1, so we may
+	 *      be waiting for a connection attempt to complete.
+	 *   4. the connection + handshake are complete
+	 *
+	 * #2 and #3 are quite similar, we want both the connection and the
+	 * handshake to complete before going any further. Thus we must always
+	 * wait for a connection to complete unless we're before and existing
+	 * step 1.
 	 */
-	if (check->current_step && (!(conn->flags & CO_FL_CONNECTED))) {
-		/* update expire time, should be done by process_chk */
+	if ((!(conn->flags & CO_FL_CONNECTED) || (conn->flags & CO_FL_HANDSHAKE)) &&
+	    (check->current_step || LIST_ISEMPTY(head))) {
 		/* we allow up to min(inter, timeout.connect) for a connection
 		 * to establish but only when timeout.check is set
 		 * as it may be to short for a full check otherwise
@@ -1867,42 +1906,36 @@ static void tcpcheck_main(struct connection *conn)
 		return;
 	}
 
-	/* here, we know that the connection is established */
-	if (check->result != CHK_RES_UNKNOWN)
+	/* special case: option tcp-check with no rule, a connect is enough */
+	if (LIST_ISEMPTY(head)) {
+		set_server_check_status(check, HCHK_STATUS_L4OK, NULL);
 		goto out_end_tcpcheck;
+	}
 
-	/* head is be the first element of the double chained list */
-	head = &s->proxy->tcpcheck_rules;
-
-	/* no step means first step
-	 * initialisation */
+	/* no step means first step initialisation */
 	if (check->current_step == NULL) {
+		check->last_started_step = NULL;
 		check->bo->p = check->bo->data;
 		check->bo->o = 0;
 		check->bi->p = check->bi->data;
 		check->bi->i = 0;
-		cur = check->current_step = LIST_ELEM(head->n, struct tcpcheck_rule *, list);
+		check->current_step = LIST_ELEM(head->n, struct tcpcheck_rule *, list);
 		t->expire = tick_add(now_ms, MS_TO_TICKS(check->inter));
 		if (s->proxy->timeout.check)
 			t->expire = tick_add_ifset(now_ms, s->proxy->timeout.check);
 	}
-	/* keep on processing step */
-	else {
-		cur = check->current_step;
-	}
-
-	if (conn->flags & CO_FL_HANDSHAKE)
-		return;
 
 	/* It's only the rules which will enable send/recv */
 	__conn_data_stop_both(conn);
 
 	while (1) {
-		/* we have to try to flush the output buffer before reading, at the end,
-		 * or if we're about to send a string that does not fit in the remaining space.
+		/* We have to try to flush the output buffer before reading, at
+		 * the end, or if we're about to send a string that does not fit
+		 * in the remaining space. That explains why we break out of the
+		 * loop after this control.
 		 */
 		if (check->bo->o &&
-		    (&cur->list == head ||
+		    (&check->current_step->list == head ||
 		     check->current_step->action != TCPCHK_ACT_SEND ||
 		     check->current_step->string_len >= buffer_total_space(check->bo))) {
 
@@ -1912,16 +1945,20 @@ static void tcpcheck_main(struct connection *conn)
 					__conn_data_stop_both(conn);
 					goto out_end_tcpcheck;
 				}
-				goto out_need_io;
+				break;
 			}
 		}
 
-		/* did we reach the end ? If so, let's check that everything was sent */
-		if (&cur->list == head) {
-			if (check->bo->o)
-				goto out_need_io;
+		if (&check->current_step->list == head)
 			break;
-		}
+
+		/* have 'next' point to the next rule or NULL if we're on the
+		 * last one, connect() needs this.
+		 */
+		next = LIST_NEXT(&check->current_step->list, struct tcpcheck_rule *, list);
+
+		if (&next->list == head)
+			next = NULL;
 
 		if (check->current_step->action == TCPCHK_ACT_CONNECT) {
 			struct protocol *proto;
@@ -1972,7 +2009,9 @@ static void tcpcheck_main(struct connection *conn)
 
 			ret = SN_ERR_INTERNAL;
 			if (proto->connect)
-				ret = proto->connect(conn, check->type, (check->type) ? 0 : 2);
+				ret = proto->connect(conn,
+						     1 /* I/O polling is always needed */,
+						     (next && next->action == TCPCHK_ACT_EXPECT) ? 0 : 2);
 			conn->flags |= CO_FL_WAKE_DATA;
 			if (check->current_step->conn_opts & TCPCHK_OPT_SEND_PROXY) {
 				conn->send_proxy_ofs = 1;
@@ -2019,8 +2058,10 @@ static void tcpcheck_main(struct connection *conn)
 			}
 
 			/* allow next rule */
-			cur = (struct tcpcheck_rule *)cur->list.n;
-			check->current_step = cur;
+			check->current_step = LIST_NEXT(&check->current_step->list, struct tcpcheck_rule *, list);
+
+			if (&check->current_step->list == head)
+				break;
 
 			/* don't do anything until the connection is established */
 			if (!(conn->flags & CO_FL_CONNECTED)) {
@@ -2074,8 +2115,10 @@ static void tcpcheck_main(struct connection *conn)
 			*check->bo->p = '\0'; /* to make gdb output easier to read */
 
 			/* go to next rule and try to send */
-			cur = (struct tcpcheck_rule *)cur->list.n;
-			check->current_step = cur;
+			check->current_step = LIST_NEXT(&check->current_step->list, struct tcpcheck_rule *, list);
+
+			if (&check->current_step->list == head)
+				break;
 		} /* end 'send' */
 		else if (check->current_step->action == TCPCHK_ACT_EXPECT) {
 			if (unlikely(check->result == CHK_RES_FAILED))
@@ -2095,7 +2138,7 @@ static void tcpcheck_main(struct connection *conn)
 					}
 				}
 				else
-					goto out_need_io;
+					break;
 			}
 
 			/* mark the step as started */
@@ -2128,14 +2171,14 @@ static void tcpcheck_main(struct connection *conn)
 				goto out_end_tcpcheck;
 			}
 
-			if (!done && (cur->string != NULL) && (check->bi->i < cur->string_len) )
+			if (!done && (check->current_step->string != NULL) && (check->bi->i < check->current_step->string_len) )
 				continue; /* try to read more */
 
 		tcpcheck_expect:
-			if (cur->string != NULL)
-				ret = my_memmem(contentptr, check->bi->i, cur->string, cur->string_len) != NULL;
-			else if (cur->expect_regex != NULL)
-				ret = regex_exec(cur->expect_regex, contentptr);
+			if (check->current_step->string != NULL)
+				ret = my_memmem(contentptr, check->bi->i, check->current_step->string, check->current_step->string_len) != NULL;
+			else if (check->current_step->expect_regex != NULL)
+				ret = regex_exec(check->current_step->expect_regex, contentptr);
 
 			if (!ret && !done)
 				continue; /* try to read more */
@@ -2143,11 +2186,11 @@ static void tcpcheck_main(struct connection *conn)
 			/* matched */
 			if (ret) {
 				/* matched but we did not want to => ERROR */
-				if (cur->inverse) {
+				if (check->current_step->inverse) {
 					/* we were looking for a string */
-					if (cur->string != NULL) {
+					if (check->current_step->string != NULL) {
 						chunk_printf(&trash, "TCPCHK matched unwanted content '%s' at step %d",
-								cur->string, tcpcheck_get_step_id(s));
+						             check->current_step->string, tcpcheck_get_step_id(s));
 					}
 					else {
 					/* we were looking for a regex */
@@ -2159,8 +2202,12 @@ static void tcpcheck_main(struct connection *conn)
 				}
 				/* matched and was supposed to => OK, next step */
 				else {
-					cur = (struct tcpcheck_rule*)cur->list.n;
-					check->current_step = cur;
+					/* allow next rule */
+					check->current_step = LIST_NEXT(&check->current_step->list, struct tcpcheck_rule *, list);
+
+					if (&check->current_step->list == head)
+						break;
+
 					if (check->current_step->action == TCPCHK_ACT_EXPECT)
 						goto tcpcheck_expect;
 					__conn_data_stop_recv(conn);
@@ -2169,9 +2216,13 @@ static void tcpcheck_main(struct connection *conn)
 			else {
 			/* not matched */
 				/* not matched and was not supposed to => OK, next step */
-				if (cur->inverse) {
-					cur = (struct tcpcheck_rule*)cur->list.n;
-					check->current_step = cur;
+				if (check->current_step->inverse) {
+					/* allow next rule */
+					check->current_step = LIST_NEXT(&check->current_step->list, struct tcpcheck_rule *, list);
+
+					if (&check->current_step->list == head)
+						break;
+
 					if (check->current_step->action == TCPCHK_ACT_EXPECT)
 						goto tcpcheck_expect;
 					__conn_data_stop_recv(conn);
@@ -2179,9 +2230,9 @@ static void tcpcheck_main(struct connection *conn)
 				/* not matched but was supposed to => ERROR */
 				else {
 					/* we were looking for a string */
-					if (cur->string != NULL) {
+					if (check->current_step->string != NULL) {
 						chunk_printf(&trash, "TCPCHK did not match content '%s' at step %d",
-								cur->string, tcpcheck_get_step_id(s));
+						             check->current_step->string, tcpcheck_get_step_id(s));
 					}
 					else {
 					/* we were looking for a regex */
@@ -2195,14 +2246,20 @@ static void tcpcheck_main(struct connection *conn)
 		} /* end expect */
 	} /* end loop over double chained step list */
 
-	set_server_check_status(check, HCHK_STATUS_L7OKD, "(tcp-check)");
-	goto out_end_tcpcheck;
+	/* We're waiting for some I/O to complete, we've reached the end of the
+	 * rules, or both. Do what we have to do, otherwise we're done.
+	 */
+	if (&check->current_step->list == head && !check->bo->o) {
+		set_server_check_status(check, HCHK_STATUS_L7OKD, "(tcp-check)");
+		goto out_end_tcpcheck;
+	}
 
- out_need_io:
+	/* warning, current_step may now point to the head */
 	if (check->bo->o)
 		__conn_data_want_send(conn);
 
-	if (check->current_step->action == TCPCHK_ACT_EXPECT)
+	if (&check->current_step->list != head &&
+	    check->current_step->action == TCPCHK_ACT_EXPECT)
 		__conn_data_want_recv(conn);
 	return;
 
@@ -2218,7 +2275,6 @@ static void tcpcheck_main(struct connection *conn)
 		conn->flags |= CO_FL_ERROR;
 
 	__conn_data_stop_both(conn);
-
 	return;
 }
 

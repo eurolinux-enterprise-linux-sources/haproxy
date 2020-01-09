@@ -151,6 +151,7 @@ static const struct cfg_opt cfg_opts[] =
 	{ "contstats",    PR_O_CONTSTATS,  PR_CAP_FE, 0, 0 },
 	{ "dontlognull",  PR_O_NULLNOLOG,  PR_CAP_FE, 0, 0 },
 	{ "http_proxy",	  PR_O_HTTP_PROXY, PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
+	{ "http-ignore-probes", PR_O_IGNORE_PRB, PR_CAP_FE, 0, PR_MODE_HTTP },
 	{ "prefer-last-server", PR_O_PREF_LAST,  PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "logasap",      PR_O_LOGASAP,    PR_CAP_FE, 0, 0 },
 	{ "nolinger",     PR_O_TCP_NOLING, PR_CAP_FE | PR_CAP_BE, 0, 0 },
@@ -317,6 +318,19 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 	return 0;
 }
 
+/* Report a warning if a rule is placed after a 'tcp-request content' rule.
+ * Return 1 if the warning has been emitted, otherwise 0.
+ */
+int warnif_rule_after_tcp_cont(struct proxy *proxy, const char *file, int line, const char *arg)
+{
+	if (!LIST_ISEMPTY(&proxy->tcp_req.inspect_rules)) {
+		Warning("parsing [%s:%d] : a '%s' rule placed after a 'tcp-request content' rule will still be processed before.\n",
+			file, line, arg);
+		return 1;
+	}
+	return 0;
+}
+
 /* Report a warning if a rule is placed after a 'block' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
@@ -406,6 +420,31 @@ int warnif_rule_after_use_server(struct proxy *proxy, const char *file, int line
 		return 1;
 	}
 	return 0;
+}
+
+/* report a warning if a "tcp request connection" rule is dangerously placed */
+int warnif_misplaced_tcp_conn(struct proxy *proxy, const char *file, int line, const char *arg)
+{
+	return	warnif_rule_after_tcp_cont(proxy, file, line, arg) ||
+		warnif_rule_after_block(proxy, file, line, arg) ||
+		warnif_rule_after_http_req(proxy, file, line, arg) ||
+		warnif_rule_after_reqxxx(proxy, file, line, arg) ||
+		warnif_rule_after_reqadd(proxy, file, line, arg) ||
+		warnif_rule_after_redirect(proxy, file, line, arg) ||
+		warnif_rule_after_use_backend(proxy, file, line, arg) ||
+		warnif_rule_after_use_server(proxy, file, line, arg);
+}
+
+/* report a warning if a "tcp request content" rule is dangerously placed */
+int warnif_misplaced_tcp_cont(struct proxy *proxy, const char *file, int line, const char *arg)
+{
+	return	warnif_rule_after_block(proxy, file, line, arg) ||
+		warnif_rule_after_http_req(proxy, file, line, arg) ||
+		warnif_rule_after_reqxxx(proxy, file, line, arg) ||
+		warnif_rule_after_reqadd(proxy, file, line, arg) ||
+		warnif_rule_after_redirect(proxy, file, line, arg) ||
+		warnif_rule_after_use_backend(proxy, file, line, arg) ||
+		warnif_rule_after_use_server(proxy, file, line, arg);
 }
 
 /* report a warning if a block rule is dangerously placed */
@@ -664,6 +703,11 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		global.tune.bufsize = atol(args[1]);
+		if (global.tune.bufsize <= 0) {
+			Alert("parsing [%s:%d] : '%s' expects a positive integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
 		if (global.tune.maxrewrite >= global.tune.bufsize / 2)
 			global.tune.maxrewrite = global.tune.bufsize / 2;
 		chunk_init(&trash, realloc(trash.str, global.tune.bufsize), global.tune.bufsize);
@@ -851,7 +895,12 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		global.uid = atol(args[1]);
+		if (strl2irc(args[1], strlen(args[1]), &global.uid) != 0) {
+			Warning("parsing [%s:%d] :  uid: string '%s' is not a number.\n   | You might want to use the 'user' parameter to use a system user name.\n", file, linenum, args[1]);
+			err_code |= ERR_WARN;
+			goto out;
+		}
+
 	}
 	else if (!strcmp(args[0], "gid")) {
 		if (global.gid != 0) {
@@ -864,7 +913,11 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		global.gid = atol(args[1]);
+		if (strl2irc(args[1], strlen(args[1]), &global.gid) != 0) {
+			Warning("parsing [%s:%d] :  gid: string '%s' is not a number.\n   | You might want to use the 'group' parameter to use a system group name.\n", file, linenum, args[1]);
+			err_code |= ERR_WARN;
+			goto out;
+		}
 	}
 	/* user/group name handling */
 	else if (!strcmp(args[0], "user")) {
@@ -1705,6 +1758,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		curpeers->conf.line = linenum;
 		curpeers->last_change = now.tv_sec;
 		curpeers->id = strdup(args[1]);
+		curpeers->state = PR_STNEW;
 	}
 	else if (strcmp(args[0], "peer") == 0) { /* peer definition */
 		struct sockaddr_storage *sk;
@@ -1796,11 +1850,12 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 				curpeers->peers_fe->cap = PR_CAP_FE;
 				curpeers->peers_fe->maxconn = 0;
 				curpeers->peers_fe->conn_retries = CONN_RETRIES;
-				curpeers->peers_fe->timeout.connect = 5000;
+				curpeers->peers_fe->timeout.client = MS_TO_TICKS(5000);
 				curpeers->peers_fe->accept = peer_accept;
 				curpeers->peers_fe->options2 |= PR_O2_INDEPSTR | PR_O2_SMARTCON | PR_O2_SMARTACC;
 				curpeers->peers_fe->conf.args.file = curpeers->peers_fe->conf.file = strdup(file);
 				curpeers->peers_fe->conf.args.line = curpeers->peers_fe->conf.line = linenum;
+				curpeers->peers_fe->bind_proc = 0; /* will be filled by users */
 
 				bind_conf = bind_conf_alloc(&curpeers->peers_fe->conf.bind, file, linenum, args[2]);
 
@@ -1837,6 +1892,12 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			}
 		}
 	} /* neither "peer" nor "peers" */
+	else if (!strcmp(args[0], "disabled")) {  /* disables this peers section */
+		curpeers->state = PR_STSTOPPED;
+	}
+	else if (!strcmp(args[0], "enabled")) {  /* enables this peers section (used to revert a disabled default) */
+		curpeers->state = PR_STNEW;
+	}
 	else if (*args[0] != 0) {
 		Alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section\n", file, linenum, args[0], cursection);
 		err_code |= ERR_ALERT | ERR_FATAL;
@@ -1965,7 +2026,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		curproxy->no_options = defproxy.no_options;
 		curproxy->no_options2 = defproxy.no_options2;
 		curproxy->bind_proc = defproxy.bind_proc;
-		curproxy->lbprm.algo = defproxy.lbprm.algo;
 		curproxy->except_net = defproxy.except_net;
 		curproxy->except_mask = defproxy.except_mask;
 		curproxy->except_to = defproxy.except_to;
@@ -1999,6 +2059,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		if (curproxy->cap & PR_CAP_BE) {
+			curproxy->lbprm.algo = defproxy.lbprm.algo;
 			curproxy->fullconn = defproxy.fullconn;
 			curproxy->conn_retries = defproxy.conn_retries;
 			curproxy->max_ka_queue = defproxy.max_ka_queue;
@@ -3161,6 +3222,12 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
+				if (val > INT_MAX) {
+					Alert("parsing [%s:%d] : Expire value [%u]ms exceeds maxmimum value of 24.85 days.\n",
+					      file, linenum, val);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
 				curproxy->table.expire = val;
 				myidx++;
 			}
@@ -3746,7 +3813,7 @@ stats_error_parsing:
 					curproxy->options2 |= PR_O2_CLFLOG;
 					logformat = clf_http_log_format;
 				} else {
-					Alert("parsing [%s:%d] : keyword '%s' only supports option 'clf'.\n", file, linenum, args[2]);
+					Alert("parsing [%s:%d] : keyword '%s' only supports option 'clf'.\n", file, linenum, args[1]);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
 				}
@@ -4316,18 +4383,16 @@ stats_error_parsing:
 			const char *ptr_arg;
 			int cur_arg;
 			struct tcpcheck_rule *tcpcheck;
-			struct list *l;
 
 			/* check if first rule is also a 'connect' action */
-			l = (struct list *)&curproxy->tcpcheck_rules;
-			if (l->p != l->n) {
-				tcpcheck = (struct tcpcheck_rule *)l->n;
-				if (tcpcheck && tcpcheck->action != TCPCHK_ACT_CONNECT) {
-					Alert("parsing [%s:%d] : first step MUST also be a 'connect' when there is a 'connect' step in the tcp-check ruleset.\n",
-					      file, linenum);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
+			tcpcheck = LIST_NEXT(&curproxy->tcpcheck_rules, struct tcpcheck_rule *, list);
+
+			if (&tcpcheck->list != &curproxy->tcpcheck_rules
+			    && tcpcheck->action != TCPCHK_ACT_CONNECT) {
+				Alert("parsing [%s:%d] : first step MUST also be a 'connect' when there is a 'connect' step in the tcp-check ruleset.\n",
+				      file, linenum);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
 			}
 
 			cur_arg = 2;
@@ -5389,8 +5454,8 @@ stats_error_parsing:
 		}
 
 		if (rc >= HTTP_ERR_SIZE) {
-			Warning("parsing [%s:%d] : status code %d not handled, error relocation will be ignored.\n",
-				file, linenum, errnum);
+			Warning("parsing [%s:%d] : status code %d not handled by '%s', error relocation will be ignored.\n",
+				file, linenum, errnum, args[0]);
 			free(err);
 		}
 	}
@@ -5449,8 +5514,8 @@ stats_error_parsing:
 		}
 
 		if (rc >= HTTP_ERR_SIZE) {
-			Warning("parsing [%s:%d] : status code %d not handled, error customization will be ignored.\n",
-				file, linenum, errnum);
+			Warning("parsing [%s:%d] : status code %d not handled by '%s', error customization will be ignored.\n",
+				file, linenum, errnum, args[0]);
 			err_code |= ERR_WARN;
 			free(err);
 		}
@@ -5624,6 +5689,9 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		if (!userlist)
+			goto out;
+
 		for (ag = userlist->groups; ag; ag = ag->next)
 			if (!strcmp(ag->name, args[1])) {
 				Warning("parsing [%s:%d]: ignoring duplicated group '%s' in userlist '%s'.\n",
@@ -5674,6 +5742,8 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
+		if (!userlist)
+			goto out;
 
 		for (newuser = userlist->users; newuser; newuser = newuser->next)
 			if (!strcmp(newuser->user, args[1])) {
@@ -5932,6 +6002,69 @@ int readcfgfile(const char *file)
 	return err_code;
 }
 
+/* This function propagates processes from frontend <from> to backend <to> so
+ * that it is always guaranteed that a backend pointed to by a frontend is
+ * bound to all of its processes. After that, if the target is a "listen"
+ * instance, the function recursively descends the target's own targets along
+ * default_backend, use_backend rules, and reqsetbe rules. Since the bits are
+ * checked first to ensure that <to> is already bound to all processes of
+ * <from>, there is no risk of looping and we ensure to follow the shortest
+ * path to the destination.
+ *
+ * It is possible to set <to> to NULL for the first call so that the function
+ * takes care of visiting the initial frontend in <from>.
+ *
+ * It is important to note that the function relies on the fact that all names
+ * have already been resolved.
+ */
+void propagate_processes(struct proxy *from, struct proxy *to)
+{
+	struct switching_rule *rule;
+	struct hdr_exp *exp;
+
+	if (to) {
+		/* check whether we need to go down */
+		if (from->bind_proc &&
+		    (from->bind_proc & to->bind_proc) == from->bind_proc)
+			return;
+
+		if (!from->bind_proc && !to->bind_proc)
+			return;
+
+		to->bind_proc = from->bind_proc ?
+			(to->bind_proc | from->bind_proc) : 0;
+
+		/* now propagate down */
+		from = to;
+	}
+
+	if (!(from->cap & PR_CAP_FE))
+		return;
+
+	if (from->state == PR_STSTOPPED)
+		return;
+
+	/* default_backend */
+	if (from->defbe.be)
+		propagate_processes(from, from->defbe.be);
+
+	/* use_backend */
+	list_for_each_entry(rule, &from->switching_rules, list) {
+		if (rule->dynamic)
+			continue;
+		to = rule->be.backend;
+		propagate_processes(from, to);
+	}
+
+	/* reqsetbe */
+	for (exp = from->req_exp; exp != NULL; exp = exp->next) {
+		if (exp->action != ACT_SETBE)
+			continue;
+		to = (struct proxy *)exp->replace;
+		propagate_processes(from, to);
+	}
+}
+
 /*
  * Returns the error code, 0 if OK, or any combination of :
  *  - ERR_ABORT: must abort ASAP
@@ -5984,12 +6117,11 @@ int check_config_validity()
 		proxy = next;
 	}
 
-	while (curproxy != NULL) {
+	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
 		struct switching_rule *rule;
 		struct server_rule *srule;
 		struct sticking_rule *mrule;
 		struct tcp_rule *trule;
-		struct listener *listener;
 		unsigned int next_id;
 		int nbproc;
 
@@ -6007,7 +6139,8 @@ int check_config_validity()
 		if (curproxy->state == PR_STSTOPPED) {
 			/* ensure we don't keep listeners uselessly bound */
 			stop_proxy(curproxy);
-			curproxy = curproxy->next;
+			free((void *)curproxy->table.peers.name);
+			curproxy->table.peers.p = NULL;
 			continue;
 		}
 
@@ -6017,7 +6150,7 @@ int check_config_validity()
 			/* an explicit bind-process was specified, let's check how many
 			 * processes remain.
 			 */
-			nbproc = popcount(curproxy->bind_proc);
+			nbproc = my_popcountl(curproxy->bind_proc);
 
 			curproxy->bind_proc &= nbits(global.nbproc);
 			if (!curproxy->bind_proc && nbproc == 1) {
@@ -6042,7 +6175,7 @@ int check_config_validity()
 				mask &= curproxy->bind_proc;
 			/* mask cannot be null here thanks to the previous checks */
 
-			nbproc = popcount(bind_conf->bind_proc);
+			nbproc = my_popcountl(bind_conf->bind_proc);
 			bind_conf->bind_proc &= mask;
 
 			if (!bind_conf->bind_proc && nbproc == 1) {
@@ -6055,20 +6188,6 @@ int check_config_validity()
 					curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
 				bind_conf->bind_proc = 0;
 			}
-		}
-
-		/* here, if bind_proc is null, it means no limit, otherwise it's explicit.
-		 * We now check how many processes the proxy will effectively run on.
-		 */
-
-		nbproc = global.nbproc;
-		if (curproxy->bind_proc)
-			nbproc = popcount(curproxy->bind_proc & nbits(global.nbproc));
-
-		if (global.nbproc > 1 && curproxy->table.peers.name) {
-			Alert("Proxy '%s': peers can't be used in multi-process mode (nbproc > 1).\n",
-			      curproxy->id);
-			cfgerr++;
 		}
 
 		switch (curproxy->mode) {
@@ -6092,6 +6211,12 @@ int check_config_validity()
 		case PR_MODE_HTTP:
 			curproxy->http_needed = 1;
 			break;
+		}
+
+		if ((curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->conf.listeners)) {
+			Warning("config : %s '%s' has no 'bind' directive. Please declare it as a backend if this was intended.\n",
+			        proxy_type_str(curproxy), curproxy->id);
+			err_code |= ERR_WARN;
 		}
 
 		if ((curproxy->cap & PR_CAP_BE) && (curproxy->mode != PR_MODE_HEALTH)) {
@@ -6162,12 +6287,6 @@ int check_config_validity()
 			} else {
 				free(curproxy->defbe.name);
 				curproxy->defbe.be = target;
-				/* we force the backend to be present on at least all of
-				 * the frontend's processes.
-				 */
-				if (target->bind_proc)
-					target->bind_proc = curproxy->bind_proc ?
-						(target->bind_proc | curproxy->bind_proc) : 0;
 
 				/* Emit a warning if this proxy also has some servers */
 				if (curproxy->srv) {
@@ -6200,12 +6319,6 @@ int check_config_validity()
 				} else {
 					free((void *)exp->replace);
 					exp->replace = (const char *)target;
-					/* we force the backend to be present on at least all of
-					 * the frontend's processes.
-					 */
-					if (target->bind_proc)
-						target->bind_proc = curproxy->bind_proc ?
-							(target->bind_proc | curproxy->bind_proc) : 0;
 				}
 			}
 		}
@@ -6254,16 +6367,10 @@ int check_config_validity()
 			} else {
 				free((void *)rule->be.name);
 				rule->be.backend = target;
-				/* we force the backend to be present on at least all of
-				 * the frontend's processes.
-				 */
-				if (target->bind_proc)
-					target->bind_proc = curproxy->bind_proc ?
-						(target->bind_proc | curproxy->bind_proc) : 0;
 			}
 		}
 
-		/* find the target proxy for 'use_backend' rules */
+		/* find the target server for 'use_server' rules */
 		list_for_each_entry(srule, &curproxy->server_rules, list) {
 			struct server *target = findserver(curproxy, srule->srv.name);
 
@@ -6451,6 +6558,10 @@ int check_config_validity()
 				curproxy->table.peers.p = NULL;
 				cfgerr++;
 			}
+			else if (curpeers->state == PR_STSTOPPED) {
+				/* silently disable this peers section */
+				curproxy->table.peers.p = NULL;
+			}
 			else if (!curpeers->peers_fe) {
 				Alert("Proxy '%s': unable to find local peer '%s' in peers section '%s'.\n",
 				      curproxy->id, localpeer, curpeers->id);
@@ -6531,7 +6642,7 @@ out_uri_auth_compat:
 			curproxy->conf.args.file = curproxy->conf.uif_file;
 			curproxy->conf.args.line = curproxy->conf.uif_line;
 			parse_logformat_string(curproxy->conf.uniqueid_format_string, curproxy, &curproxy->format_unique_id, LOG_OPT_HTTP,
-					       (proxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+					       (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
 					       curproxy->conf.uif_file, curproxy->conf.uif_line);
 			curproxy->conf.args.file = NULL;
 			curproxy->conf.args.line = 0;
@@ -6778,7 +6889,6 @@ out_uri_auth_compat:
 					newsrv->admin |= SRV_ADMF_IMAINT;
 					newsrv->state = SRV_ST_STOPPED;
 					newsrv->check.health = 0;
-					newsrv->agent.health = 0;
 				}
 
 				newsrv->track = srv;
@@ -6929,6 +7039,29 @@ out_uri_auth_compat:
 			newsrv = newsrv->next;
 		}
 
+		/* check if we have a frontend with "tcp-request content" looking at L7
+		 * with no inspect-delay
+		 */
+		if ((curproxy->cap & PR_CAP_FE) && !curproxy->tcp_req.inspect_delay) {
+			list_for_each_entry(trule, &curproxy->tcp_req.inspect_rules, list) {
+				if (trule->action == TCP_ACT_CAPTURE &&
+				    !(trule->act_prm.cap.expr->fetch->val & SMP_VAL_FE_SES_ACC))
+					break;
+				if  ((trule->action >= TCP_ACT_TRK_SC0 && trule->action <= TCP_ACT_TRK_SCMAX) &&
+				     !(trule->act_prm.trk_ctr.expr->fetch->val & SMP_VAL_FE_SES_ACC))
+					break;
+			}
+
+			if (&trule->list != &curproxy->tcp_req.inspect_rules) {
+				Warning("config : %s '%s' : some 'tcp-request content' rules explicitly depending on request"
+				        " contents were found in a frontend without any 'tcp-request inspect-delay' setting."
+				        " This means that these rules will randomly find their contents. This can be fixed by"
+					" setting the tcp-request inspect-delay.\n",
+				        proxy_type_str(curproxy), curproxy->id);
+				err_code |= ERR_WARN;
+			}
+		}
+
 		if (curproxy->cap & PR_CAP_FE) {
 			if (!curproxy->accept)
 				curproxy->accept = frontend_accept;
@@ -6965,6 +7098,87 @@ out_uri_auth_compat:
 			if (curproxy->options2 & PR_O2_RDPC_PRST)
 				curproxy->be_req_ana |= AN_REQ_PRST_RDP_COOKIE;
 		}
+	}
+
+	/***********************************************************/
+	/* At this point, target names have already been resolved. */
+	/***********************************************************/
+
+	/* Check multi-process mode compatibility */
+
+	if (global.nbproc > 1 && global.stats_fe) {
+		list_for_each_entry(bind_conf, &global.stats_fe->conf.bind, by_fe) {
+			unsigned long mask;
+
+			mask = nbits(global.nbproc);
+			if (global.stats_fe->bind_proc)
+				mask &= global.stats_fe->bind_proc;
+
+			if (bind_conf->bind_proc)
+				mask &= bind_conf->bind_proc;
+
+			/* stop here if more than one process is used */
+			if (my_popcountl(mask) > 1)
+				break;
+		}
+		if (&bind_conf->by_fe != &global.stats_fe->conf.bind) {
+			Warning("stats socket will not work as expected in multi-process mode (nbproc > 1), you should force process binding globally using 'stats bind-process' or per socket using the 'process' attribute.\n");
+		}
+	}
+
+	/* Make each frontend inherit bind-process from its listeners when not specified. */
+	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
+		if (curproxy->bind_proc)
+			continue;
+
+		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
+			unsigned long mask;
+
+			mask = bind_conf->bind_proc ? bind_conf->bind_proc : nbits(global.nbproc);
+			curproxy->bind_proc |= mask;
+		}
+
+		if (!curproxy->bind_proc)
+			curproxy->bind_proc = nbits(global.nbproc);
+	}
+
+	if (global.stats_fe) {
+		list_for_each_entry(bind_conf, &global.stats_fe->conf.bind, by_fe) {
+			unsigned long mask;
+
+			mask = bind_conf->bind_proc ? bind_conf->bind_proc : 0;
+			global.stats_fe->bind_proc |= mask;
+		}
+		if (!global.stats_fe->bind_proc)
+			global.stats_fe->bind_proc = nbits(global.nbproc);
+	}
+
+	/* propagate bindings from frontends to backends. Don't do it if there
+	 * are any fatal errors as we must not call it with unresolved proxies.
+	 */
+	if (!cfgerr) {
+		for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
+			if (curproxy->cap & PR_CAP_FE)
+				propagate_processes(curproxy, NULL);
+		}
+	}
+
+	/* Bind each unbound backend to all processes when not specified. */
+	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
+		if (curproxy->bind_proc)
+			continue;
+		curproxy->bind_proc = nbits(global.nbproc);
+	}
+
+	/*******************************************************/
+	/* At this step, all proxies have a non-null bind_proc */
+	/*******************************************************/
+
+	/* perform the final checks before creating tasks */
+
+	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
+		struct listener *listener;
+		unsigned int next_id;
 
 #ifdef USE_OPENSSL
 		/* Configure SSL for each bind line.
@@ -7006,6 +7220,15 @@ out_uri_auth_compat:
 		/* adjust this proxy's listeners */
 		next_id = 1;
 		list_for_each_entry(listener, &curproxy->conf.listeners, by_fe) {
+			int nbproc;
+
+			nbproc = my_popcountl(curproxy->bind_proc &
+			                      (listener->bind_conf->bind_proc ? listener->bind_conf->bind_proc : curproxy->bind_proc) &
+			                      nbits(global.nbproc));
+
+			if (!nbproc) /* no intersection between listener and frontend */
+				nbproc = 1;
+
 			if (!listener->luid) {
 				/* listener ID not set, use automatic numbering with first
 				 * spare entry starting with next_luid.
@@ -7076,10 +7299,21 @@ out_uri_auth_compat:
 #endif /* USE_OPENSSL */
 		}
 
-		if (nbproc > 1) {
+		if (my_popcountl(curproxy->bind_proc & nbits(global.nbproc)) > 1) {
 			if (curproxy->uri_auth) {
-				Warning("Proxy '%s': in multi-process mode, stats will be limited to process assigned to the current request.\n",
-				        curproxy->id);
+				int count, maxproc = 0;
+
+				list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
+					count = my_popcountl(bind_conf->bind_proc);
+					if (count > maxproc)
+						maxproc = count;
+				}
+				/* backends have 0, frontends have 1 or more */
+				if (maxproc != 1)
+					Warning("Proxy '%s': in multi-process mode, stats will be"
+					        " limited to process assigned to the current request.\n",
+					        curproxy->id);
+
 				if (!LIST_ISEMPTY(&curproxy->uri_auth->admin_rules)) {
 					Warning("Proxy '%s': stats admin will not work correctly in multi-process mode.\n",
 					        curproxy->id);
@@ -7108,29 +7342,6 @@ out_uri_auth_compat:
 			Alert("Proxy '%s': no more memory when trying to allocate the management task\n",
 			      curproxy->id);
 			cfgerr++;
-		}
-
-		curproxy = curproxy->next;
-	}
-
-	/* Check multi-process mode compatibility */
-	if (global.nbproc > 1 && global.stats_fe) {
-		list_for_each_entry(bind_conf, &global.stats_fe->conf.bind, by_fe) {
-			unsigned long mask;
-
-			mask = nbits(global.nbproc);
-			if (global.stats_fe->bind_proc)
-				mask &= global.stats_fe->bind_proc;
-
-			if (bind_conf->bind_proc)
-				mask &= bind_conf->bind_proc;
-
-			/* stop here if more than one process is used */
-			if (popcount(mask) > 1)
-				break;
-		}
-		if (&bind_conf->by_fe != &global.stats_fe->conf.bind) {
-			Warning("stats socket will not work as expected in multi-process mode (nbproc > 1), you should force process binding globally using 'stats bind-process' or per socket using the 'process' attribute.\n");
 		}
 	}
 
@@ -7199,20 +7410,6 @@ out_uri_auth_compat:
 		}
 	}
 
-	/* initialize stick-tables on backend capable proxies. This must not
-	 * be done earlier because the data size may be discovered while parsing
-	 * other proxies.
-	 */
-	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
-		if (curproxy->state == PR_STSTOPPED)
-			continue;
-
-		if (!stktable_init(&curproxy->table)) {
-			Alert("Proxy '%s': failed to initialize stick-table.\n", curproxy->id);
-			cfgerr++;
-		}
-	}
-
 	/*
 	 * Recount currently required checks.
 	 */
@@ -7229,25 +7426,51 @@ out_uri_auth_compat:
 				global.last_checks |= cfg_opts2[optnum].checks;
 	}
 
+	/* compute the required process bindings for the peers */
+	for (curproxy = proxy; curproxy; curproxy = curproxy->next)
+		if (curproxy->table.peers.p)
+			curproxy->table.peers.p->peers_fe->bind_proc |= curproxy->bind_proc;
+
 	if (peers) {
 		struct peers *curpeers = peers, **last;
 		struct peer *p, *pb;
 
-		/* Remove all peers sections which don't have a valid listener.
-		 * This can happen when a peers section is never referenced and
-		 * does not contain a local peer.
+		/* Remove all peers sections which don't have a valid listener,
+		 * which are not used by any table, or which are bound to more
+		 * than one process.
 		 */
 		last = &peers;
 		while (*last) {
 			curpeers = *last;
-			if (curpeers->peers_fe) {
+
+			if (curpeers->state == PR_STSTOPPED) {
+				/* the "disabled" keyword was present */
+				if (curpeers->peers_fe)
+					stop_proxy(curpeers->peers_fe);
+				curpeers->peers_fe = NULL;
+			}
+			else if (!curpeers->peers_fe) {
+				Warning("Removing incomplete section 'peers %s' (no peer named '%s').\n",
+					curpeers->id, localpeer);
+			}
+			else if (my_popcountl(curpeers->peers_fe->bind_proc) != 1) {
+				/* either it's totally stopped or too much used */
+				if (curpeers->peers_fe->bind_proc) {
+					Alert("Peers section '%s': peers referenced by sections "
+					      "running in different processes (%d different ones). "
+					      "Check global.nbproc and all tables' bind-process "
+					      "settings.\n", curpeers->id, my_popcountl(curpeers->peers_fe->bind_proc));
+					cfgerr++;
+				}
+				stop_proxy(curpeers->peers_fe);
+				curpeers->peers_fe = NULL;
+			}
+			else {
 				last = &curpeers->next;
 				continue;
 			}
 
-			Warning("Removing incomplete section 'peers %s' (no peer named '%s').\n",
-				curpeers->id, localpeer);
-
+			/* clean what has been detected above */
 			p = curpeers->remote;
 			while (p) {
 				pb = p->next;
@@ -7263,6 +7486,20 @@ out_uri_auth_compat:
 			curpeers = curpeers->next;
 			free(*last);
 			*last = curpeers;
+		}
+	}
+
+	/* initialize stick-tables on backend capable proxies. This must not
+	 * be done earlier because the data size may be discovered while parsing
+	 * other proxies.
+	 */
+	for (curproxy = proxy; curproxy; curproxy = curproxy->next) {
+		if (curproxy->state == PR_STSTOPPED)
+			continue;
+
+		if (!stktable_init(&curproxy->table)) {
+			Alert("Proxy '%s': failed to initialize stick-table.\n", curproxy->id);
+			cfgerr++;
 		}
 	}
 
