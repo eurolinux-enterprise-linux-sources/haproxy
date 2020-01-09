@@ -9,7 +9,7 @@
 Name: haproxy
 Summary: HAProxy is a TCP/HTTP reverse proxy for high availability environments
 Version: 1.5.4
-Release: 2%{?dist}.2
+Release: 3%{?dist}
 
 Group: System Environment/Daemons
 License: GPLv2+
@@ -157,9 +157,9 @@ fi
 %attr(-,%{haproxy_user},%{haproxy_group}) %dir %{haproxy_home}
 
 %changelog
-* Fri Jan 22 2016 Ryan O'Hara <rohara@redhat.com> - 1.5.4-2.2
+* Wed Jan 20 2016 Ryan O'Hara <rohara@redhat.com> - 1.5.4-3
 - Fix default MAX_HOSTNAME_LEN to allow long peer names
-  Resolves: rhbz#1300386
+  Resolves: rhbz#1286504
 
 * Tue Jul 28 2015 Ryan O'Hara <rohara@redhat.com> - 1.5.4-2.1
 - Fix buffer_slow_realign() function to respect output data
