@@ -9,7 +9,7 @@
 Name: haproxy
 Summary: HAProxy is a TCP/HTTP reverse proxy for high availability environments
 Version: 1.5.4
-Release: 2%{?dist}
+Release: 2%{?dist}.1
 
 Group: System Environment/Daemons
 License: GPLv2+
@@ -23,6 +23,7 @@ Source4: haproxy.sysconfig
 Source5: halog.1
 
 Patch0: halog-unused-variables.patch
+Patch1: haproxy-buffer-slow-realign.patch
 
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 
@@ -60,6 +61,7 @@ availability environments. Indeed, it can:
 %prep
 %setup -q
 %patch0 -p0
+%patch1 -p1
 
 %build
 %ifarch %ix86 x86_64
@@ -153,6 +155,10 @@ fi
 %attr(-,%{haproxy_user},%{haproxy_group}) %dir %{haproxy_home}
 
 %changelog
+* Tue Jul 28 2015 Ryan O'Hara <rohara@redhat.com> - 1.5.4-2.1
+- Fix buffer_slow_realign() function to respect output data
+  Resolves: CVE-2015-3281
+
 * Tue Mar 03 2015 Ryan O'Hara <rohara@redhat.com> - 1.5.4-2
 - Read sysconfig file for extra options
   Resolves: rhbz#1166497
