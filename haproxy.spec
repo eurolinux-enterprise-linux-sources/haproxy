@@ -8,7 +8,7 @@
 
 Name:           haproxy
 Version:        1.5.18
-Release:        3%{?dist}.1
+Release:        6%{?dist}
 Summary:        TCP/HTTP proxy and load balancer for high availability environments
 
 Group:          System Environment/Daemons
@@ -107,12 +107,14 @@ do
 done
 
 %pre
-getent group %{haproxy_group} >/dev/null || \
-       groupadd -g 188 -r %{haproxy_group}
-getent passwd %{haproxy_user} >/dev/null || \
-       useradd -u 188 -r -g %{haproxy_group} -d %{haproxy_home} \
-       -s /sbin/nologin -c "haproxy" %{haproxy_user}
-exit 0
+getent group %{haproxy_group} >/dev/null || groupadd -f -g 188 -r %{haproxy_group}
+if ! getent passwd %{haproxy_user} >/dev/null ; then
+    if ! getent passwd 188 >/dev/null ; then
+        useradd -r -u 188 -g %{haproxy_group} -d %{haproxy_home} -s /sbin/nologin -c "haproxy" %{haproxy_user}
+    else
+        useradd -r -g %{haproxy_group} -d %{haproxy_home} -s /sbin/nologin -c "haproxy" %{haproxy_user}
+    fi
+fi
 
 %post
 %systemd_post %{name}.service
@@ -142,8 +144,14 @@ exit 0
 %attr(-,%{haproxy_user},%{haproxy_group}) %dir %{haproxy_home}
 
 %changelog
-* Fri Nov 18 2016 Ryan O'Hara <rohara@redhat.com> - 1.5.18-3.1
-- Return correct exit codes from systemd-wrapper (#1396219)
+* Mon May 01 2017 Ryan O'Hara <rohara@redhat.com> - 1.5.18-6
+- Use KillMode=mixed in systemd service file (#1444709)
+
+* Thu Mar 16 2017 Ryan O'Hara <rohara@redhat.com> - 1.5.18-5
+- Use soft-static allocation for haproxy UID/GID (#1386130)
+
+* Wed Nov 16 2016 Ryan O'Hara <rohara@redhat.com> - 1.5.18-4
+- Return correct exit codes from systemd-wrapper (#1391990)
 
 * Tue Jun 21 2016 Ryan O'Hara <rohara@redhat.com> - 1.5.18-3
 - Fix TCP user timeout patch for 1.5.18 release
