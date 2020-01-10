@@ -8,7 +8,7 @@
 
 Name:           haproxy
 Version:        1.5.18
-Release:        8%{?dist}
+Release:        9%{?dist}
 Summary:        TCP/HTTP proxy and load balancer for high availability environments
 
 Group:          System Environment/Daemons
@@ -26,6 +26,7 @@ Patch0:         halog-unused-variables.patch
 Patch1:         iprange-return-type.patch
 Patch2:         haproxy-tcp-user-timeout.patch
 Patch3:         haproxy-systemd-wrapper-exit-code.patch
+Patch4:         haproxy-tcp-check-detect-down.patch
 
 BuildRequires:  pcre-devel
 BuildRequires:  zlib-devel
@@ -57,6 +58,7 @@ availability environments. Indeed, it can:
 %patch1 -p0
 %patch2 -p1
 %patch3 -p1
+%patch4 -p1
 
 %build
 regparm_opts=
@@ -144,6 +146,9 @@ fi
 %attr(-,%{haproxy_user},%{haproxy_group}) %dir %{haproxy_home}
 
 %changelog
+* Wed Feb 27 2019 Ryan O'Hara <rohara@redhat.com> - 1.5.18-9
+- Detect down servers with mutliple tcp-check connect rules (#1677420)
+
 * Wed Jul 25 2018 Ryan O'Hara <rohara@redhat.com> - 1.5.18-8
 - Build with USE_GETADDRINFO option (#1598491)
 
