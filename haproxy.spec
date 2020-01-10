@@ -8,7 +8,7 @@
 
 Name:           haproxy
 Version:        1.5.18
-Release:        6%{?dist}
+Release:        7%{?dist}
 Summary:        TCP/HTTP proxy and load balancer for high availability environments
 
 Group:          System Environment/Daemons
@@ -144,6 +144,9 @@ fi
 %attr(-,%{haproxy_user},%{haproxy_group}) %dir %{haproxy_home}
 
 %changelog
+* Thu Nov 30 2017 Ryan O'Hara <rohara@redhat.com> - 1.5.18-7
+- Rebuild with openssl-1.0.2k (#1509139)
+
 * Mon May 01 2017 Ryan O'Hara <rohara@redhat.com> - 1.5.18-6
 - Use KillMode=mixed in systemd service file (#1444709)
 
