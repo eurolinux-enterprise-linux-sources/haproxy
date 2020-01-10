@@ -8,7 +8,7 @@
 
 Name:           haproxy
 Version:        1.5.18
-Release:        7%{?dist}
+Release:        8%{?dist}
 Summary:        TCP/HTTP proxy and load balancer for high availability environments
 
 Group:          System Environment/Daemons
@@ -64,7 +64,7 @@ regparm_opts=
 regparm_opts="USE_REGPARM=1"
 %endif
 
-%{__make} %{?_smp_mflags} CPU="generic" TARGET="linux2628" USE_OPENSSL=1 USE_PCRE=1 USE_ZLIB=1 ${regparm_opts} ADDINC="%{optflags}" USE_LINUX_TPROXY=1 ADDLIB="%{__global_ldflags}" DEFINE=-DTCP_USER_TIMEOUT=18
+%{__make} %{?_smp_mflags} CPU="generic" TARGET="linux2628" USE_OPENSSL=1 USE_PCRE=1 USE_ZLIB=1 ${regparm_opts} ADDINC="%{optflags}" USE_LINUX_TPROXY=1 USE_GETADDRINFO=1 ADDLIB="%{__global_ldflags}" DEFINE=-DTCP_USER_TIMEOUT=18
 
 pushd contrib/halog
 %{__make} halog OPTIMIZE="%{optflags}"
@@ -144,6 +144,9 @@ fi
 %attr(-,%{haproxy_user},%{haproxy_group}) %dir %{haproxy_home}
 
 %changelog
+* Wed Jul 25 2018 Ryan O'Hara <rohara@redhat.com> - 1.5.18-8
+- Build with USE_GETADDRINFO option (#1598491)
+
 * Thu Nov 30 2017 Ryan O'Hara <rohara@redhat.com> - 1.5.18-7
 - Rebuild with openssl-1.0.2k (#1509139)
 
